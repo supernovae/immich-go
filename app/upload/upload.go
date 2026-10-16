@@ -124,11 +124,20 @@ func NewUploadCommand(ctx context.Context, app *app.Application) *cobra.Command 
 
 		app.SetTZ(time.Local)
 		if tz, err := cmd.Flags().GetString("time-zone"); err == nil && tz != "" {
-			if loc, err := time.LoadLocation(tz); err == nil {
-				app.SetTZ(loc)
+			loc, err := time.LoadLocation(tz)
+			if err != nil {
+				return err
 			}
-		} else {
+			app.SetTZ(loc)
+		} else if err != nil {
 			return err
+		}
+
+		if cmd != cmd.Root() && cmd.Name() != "upload" {
+			if err := uc.client.Open(cmd.Context(), app); err != nil {
+				return err
+			}
+			app.SetSupportedMedia(uc.client.Immich.SupportedMedia())
 		}
 		return nil
 	}
@@ -138,8 +147,16 @@ func NewUploadCommand(ctx context.Context, app *app.Application) *cobra.Command 
 
 // Run is called back by the actual asset reader
 func (uc *UpCmd) Run(cmd *cobra.Command, adapter adapters.Reader) error {
-	uc.Mode = UpModeFolder // TODO
-
+	switch cmd.Name() {
+	case "from-google-photos":
+		uc.Mode = UpModeGoogleTakeout
+	case "from-icloud":
+		uc.Mode = UpModeICloud
+	case "from-picasa":
+		uc.Mode = UpModePicasa
+	default:
+		uc.Mode = UpModeFolder
+	}
 	// ready to run
 	ctx := cmd.Context()
 	err := uc.client.Open(ctx, uc.app)

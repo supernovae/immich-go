@@ -20,8 +20,6 @@ import (
 
 type VirtualGlobFS struct {
 	rootFS NameFS
-	files  map[string]fs.DirEntry
-	dirs   map[string][]string
 	parts  []string
 }
 
@@ -38,38 +36,10 @@ func NewVirtualGlobFS(pattern string) (fs.FS, error) {
 		return nil, err
 	}
 
-	vfs := &VirtualGlobFS{
+	return &VirtualGlobFS{
 		rootFS: rootFs,
-		files:  make(map[string]fs.DirEntry),
-		dirs:   make(map[string][]string),
 		parts:  parts,
-	}
-
-	err = fs.WalkDir(vfs.rootFS, ".", func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if shouldSkipDir(err) {
-				return fs.SkipDir
-			}
-			return err
-		}
-
-		// directories should always be added
-		parentDir := path.Dir(p)
-		if parentDir != p {
-			vfs.dirs[parentDir] = append(vfs.dirs[parentDir], p)
-			vfs.files[p] = d
-			return nil
-		}
-
-		if !vfs.match(p) {
-			return nil
-		}
-
-		vfs.files[p] = d
-		return nil
-	})
-
-	return vfs, err
+	}, nil
 }
 
 func shouldSkipDir(err error) bool {
@@ -98,7 +68,13 @@ func getRootFs(pattern string) (NameFS, []string, error) {
 	}
 
 	if dir == "" {
-		dir, _ = os.Getwd()
+		var err error
+		dir, err = os.Getwd()
+		if err != nil {
+			return nil, nil, err
+		}
+	} else if _, err := os.Stat(filepath.FromSlash(dir)); err != nil {
+		return nil, nil, err
 	}
 
 	return NewFSWithName(dir), strings.Split(strings.ToLower(magic), "/"), nil
@@ -128,64 +104,89 @@ func simpleRootFS(root string) (NameFS, []string, error) {
 // matches files having a path starting by the patten
 //
 //	ex:  file /path/to/file matches with the pattern /*/to
-func (gw VirtualGlobFS) match(filename string) bool {
+func (gw VirtualGlobFS) match(filename string, isDir bool) bool {
 	if filename == "." {
 		return true
 	}
 
 	lowerFName := strings.ToLower(filename)
-	if strings.HasSuffix(lowerFName, ".xmp") {
+	if !isDir && strings.HasSuffix(lowerFName, ".xmp") {
+		return true
+	}
+
+	if len(gw.parts) == 0 {
 		return true
 	}
 
 	parts := strings.Split(lowerFName, "/")
 
-	for i := 0; i < min(len(gw.parts), len(parts)); i++ {
+	for i := range min(len(gw.parts), len(parts)) {
 		if m, err := path.Match(gw.parts[i], parts[i]); err != nil || !m {
 			return false
 		}
 	}
 
-	parts = strings.Split(filename, "/")
 	if len(gw.parts) > len(parts) {
-		join := path.Join(parts[:min(len(gw.parts), len(parts))]...)
-		if f, ok := gw.files[join]; !ok || !f.IsDir() {
-			return false
-		}
+		return isDir
 	}
 	return true
 }
 
 // Open the name only if the name matches with the pattern
 func (gw VirtualGlobFS) Open(name string) (fs.File, error) {
-	if _, ok := gw.files[name]; !ok {
-		return nil, fmt.Errorf("%s: %w", name, fs.ErrNotExist)
+	f, err := gw.rootFS.Open(name)
+	if err != nil {
+		return nil, err
 	}
-	return gw.rootFS.Open(name)
+	if len(gw.parts) > 0 && name != "." {
+		fi, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		if !gw.match(name, fi.IsDir()) {
+			_ = f.Close()
+			return nil, fmt.Errorf("%s: %w", name, fs.ErrNotExist)
+		}
+	}
+	return f, nil
 }
 
 // Stat the name only if the name matches with the pattern
 func (gw VirtualGlobFS) Stat(name string) (fs.FileInfo, error) {
-	fi, ok := gw.files[name]
-	if !ok {
+	fi, err := fs.Stat(gw.rootFS, name)
+	if err != nil {
+		return nil, err
+	}
+	if !gw.match(name, fi.IsDir()) {
 		return nil, fmt.Errorf("%s: %w", name, fs.ErrNotExist)
 	}
-	return fi.Info()
+	return fi, nil
 }
 
 // ReadDir return all DirEntries that match with the pattern or .XMP files
 func (gw VirtualGlobFS) ReadDir(name string) ([]fs.DirEntry, error) {
-	files, ok := gw.dirs[name]
-	if !ok {
+	if !gw.match(name, true) {
 		return nil, fmt.Errorf("%s: %w", name, fs.ErrNotExist)
 	}
+	rawEntries, err := fs.ReadDir(gw.rootFS, name)
+	if err != nil {
+		if shouldSkipDir(err) && name != "." {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if len(gw.parts) == 0 {
+		return rawEntries, nil
+	}
 
-	entries := make([]fs.DirEntry, 0, len(files))
-	for _, f := range files {
-		if !gw.match(f) {
+	entries := make([]fs.DirEntry, 0, len(rawEntries))
+	for _, d := range rawEntries {
+		full := path.Join(name, d.Name())
+		if !gw.match(full, d.IsDir()) {
 			continue
 		}
-		entries = append(entries, gw.files[f])
+		entries = append(entries, d)
 	}
 	return entries, nil
 }
@@ -228,12 +229,15 @@ type FSWithName struct {
 
 var _ NameFS = FSWithName{}
 
-// NewFSWithName creates a new rooted filesystem at the provided root. See os.DirFS for details.
-// It then extends that by naming the FS by the base directory that's being used.
 func NewFSWithName(root string) NameFS {
+	absRoot, err := filepath.Abs(filepath.FromSlash(root))
+	name := filepath.Base(root)
+	if err == nil {
+		name = filepath.Base(absRoot)
+	}
 	return &FSWithName{
-		name: filepath.Base(root),
-		FS:   os.DirFS(root),
+		name: name,
+		FS:   os.DirFS(filepath.FromSlash(root)),
 	}
 }
 

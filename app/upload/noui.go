@@ -87,16 +87,20 @@ func (uc *UpCmd) runNoUI(ctx context.Context, app *app.Application) error {
 			return err
 		})
 		processGrp.Go(func() error {
-			return uc.getImmichAlbums(ctx)
+			err := uc.getImmichAlbums(ctx)
+			if err != nil {
+				cancel(err)
+			}
+			return err
 		})
 		processGrp.Go(func() error {
 			// Run Prepare
 			groupChan = uc.adapter.Browse(ctx)
-			return err
+			return nil
 		})
 		err = processGrp.Wait()
 		if err != nil {
-			if cause := context.Cause(ctx); cause != nil {
+			if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
 				cancel(cause)
 				close(stopProgress)
 				return cause
@@ -124,7 +128,9 @@ func (uc *UpCmd) runNoUI(ctx context.Context, app *app.Application) error {
 
 	err := uiGrp.Wait()
 	if err != nil {
-		err = context.Cause(ctx)
+		if cause := context.Cause(ctx); cause != nil {
+			err = cause
+		}
 	}
 	return err
 }

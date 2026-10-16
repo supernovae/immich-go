@@ -137,6 +137,31 @@ func Test_VirtualGlobFS(t *testing.T) {
 	}
 }
 
+func Test_VirtualGlobFS_DotNameAndStatOpen(t *testing.T) {
+	fsys, err := NewVirtualGlobFS("TESTDATA/A/T/*.jpg")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := fs.Stat(fsys, "10.jpg"); err != nil {
+		t.Errorf("expected Stat(10.jpg) to succeed, got %v", err)
+	}
+	if _, err := fs.Stat(fsys, "10.json"); err == nil {
+		t.Errorf("expected Stat(10.json) to fail on *.jpg filter")
+	}
+	if f, err := fsys.Open("10.json"); err == nil {
+		_ = f.Close()
+		t.Errorf("expected Open(10.json) to fail on *.jpg filter")
+	}
+
+	dotFS, err := NewVirtualGlobFS(".")
+	if err != nil {
+		t.Fatalf("unexpected error for '.': %v", err)
+	}
+	if name := dotFS.(NameFS).Name(); name == "." || name == "" {
+		t.Errorf("expected actual directory name for '.', got %q", name)
+	}
+}
+
 func TestFixedPathAndMagic(t *testing.T) {
 	tests := []struct {
 		name  string

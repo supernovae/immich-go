@@ -41,6 +41,7 @@ type Client struct {
 	ClientLog   *slog.Logger           // Logger
 	app         *Application
 	DryRun      bool // Protect the server from changes
+	opened      bool
 }
 
 // RegisterFlags adds client-related command-line flags to the provided flag set.
@@ -72,8 +73,10 @@ func (client *Client) RegisterFlags(flags *pflag.FlagSet, prefix string) {
 // It validates configuration, sets up logging, creates client instances,
 // and performs initial server validation including ping and authentication.
 func (client *Client) Open(ctx context.Context, app *Application) error {
+	if client.opened {
+		return nil
+	}
 	var err error
-
 	if client.Server != "" {
 		client.Server = strings.TrimSuffix(client.Server, "/")
 	}
@@ -172,19 +175,23 @@ func (client *Client) Open(ctx context.Context, app *Application) error {
 		client.Immich.SetDeviceUUID(client.DeviceUUID)
 	}
 
-	err = client.Immich.PingServer(ctx)
+	checkTimeout := min(max(client.ClientTimeout, time.Second), 30*time.Second)
+	checkCtx, cancel := context.WithTimeout(ctx, checkTimeout)
+	defer cancel()
+
+	err = client.Immich.PingServer(checkCtx)
 	if err != nil {
 		return err
 	}
 	client.ClientLog.Info("Server status: OK")
 
-	user, err := client.Immich.ValidateConnection(ctx)
+	user, err := client.Immich.ValidateConnection(checkCtx)
 	if err != nil {
 		return err
 	}
 	client.User = user
 
-	about, err := client.Immich.GetAboutInfo(ctx)
+	about, err := client.Immich.GetAboutInfo(checkCtx)
 	if err != nil {
 		return err
 	}
@@ -195,6 +202,7 @@ func (client *Client) Open(ctx context.Context, app *Application) error {
 	if client.DryRun {
 		client.ClientLog.Info("Dry-run mode enabled. No changes will be made to the server.")
 	}
+	client.opened = true
 	return nil
 }
 

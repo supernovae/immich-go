@@ -71,6 +71,7 @@ func (uc *UpCmd) runUI(ctx context.Context, app *app.Application) error {
 	ui := uc.newUI(ctx, app)
 
 	defer cancel(nil)
+	defer ui.restoreLogger(app)
 	pages := tview.NewPages()
 
 	var preparationDone atomic.Bool
@@ -94,7 +95,7 @@ func (uc *UpCmd) runUI(ctx context.Context, app *app.Application) error {
 		switch event.Key() {
 		case tcell.KeyCtrlQ, tcell.KeyCtrlC:
 			ui.restoreLogger(app)
-			cancel(errors.New("interrupted: Ctrl+C or Ctrl+Q pressed"))
+			stopUI(errors.New("interrupted: Ctrl+C or Ctrl+Q pressed"))
 		case tcell.KeyEnter:
 			if uploadDone.Load() {
 				stopUI(nil)
@@ -221,17 +222,24 @@ func (uc *UpCmd) runUI(ctx context.Context, app *app.Application) error {
 		// Wait the end of the preparation: immich assets, albums and first browsing
 		err = processGrp.Wait()
 		if err != nil {
-			return context.Cause(ctx)
+			if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+				stopUI(cause)
+				return cause
+			}
+			stopUI(err)
+			return err
 		}
 		preparationDone.Store(true)
 
 		// we can upload assets
 		err = uc.uploadLoop(ctx, groupChan)
-		// if err != nil {
-		// 	return context.Cause(ctx)
-		// }
-
-		err = errors.Join(err, uc.finishing(ctx))
+		finishErr := uc.finishing(ctx)
+		if err != nil {
+			err = errors.Join(err, finishErr)
+			stopUI(err)
+			return err
+		}
+		err = finishErr
 
 		uploadDone.Store(true)
 		counts := app.FileProcessor().Logger().GetCounts()
@@ -251,7 +259,9 @@ func (uc *UpCmd) runUI(ctx context.Context, app *app.Application) error {
 	// Wait for termination of UI processes
 	err := uiGroup.Wait()
 	if err != nil {
-		err = context.Cause(ctx)
+		if cause := context.Cause(ctx); cause != nil {
+			err = cause
+		}
 	}
 
 	// Time to leave
