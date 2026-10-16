@@ -32,7 +32,7 @@ func RootImmichGoCommand(ctx context.Context) (*cobra.Command, *app.Application)
 	a := app.New(ctx, cmd)
 
 	flags := cmd.PersistentFlags()
-	_ = a.OnErrors.Set("stop")
+	_ = a.OnErrors.Set("continue")
 	a.RegisterFlags(flags)
 	a.Log().RegisterFlags(flags)
 

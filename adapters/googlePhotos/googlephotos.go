@@ -70,7 +70,7 @@ func (af assetFile) LogValue() slog.Value {
 
 func (toc *TakeoutCmd) Browse(ctx context.Context) chan *assets.Group {
 	ctx, cancel := context.WithCancelCause(ctx)
-	gOut := make(chan *assets.Group)
+	gOut := make(chan *assets.Group, 64)
 	go func() {
 		defer close(gOut)
 
@@ -95,7 +95,8 @@ func (toc *TakeoutCmd) Browse(ctx context.Context) chan *assets.Group {
 func (toc *TakeoutCmd) passOneFsWalk(ctx context.Context, w fs.FS) error {
 	err := fs.WalkDir(w, ".", func(name string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return err
+			toc.processor.RecordNonAsset(ctx, fshelper.FSName(w, name), 0, fileevent.ErrorFileAccess, "error", err.Error())
+			return toc.app.ProcessError(err)
 		}
 
 		select {
@@ -148,8 +149,8 @@ func (toc *TakeoutCmd) passOneFsWalk(ctx context.Context, w fs.FS) error {
 				var md *assets.Metadata
 				b, err := fs.ReadFile(w, name)
 				if err != nil {
-					err = toc.app.ProcessError(err)
-					return err
+					toc.processor.RecordNonAsset(ctx, fshelper.FSName(w, name), 0, fileevent.ErrorFileAccess, "error", err.Error())
+					return toc.app.ProcessError(err)
 				}
 				if bytes.Contains(b, []byte("immich-go version:")) {
 					md, err = assets.UnMarshalMetadata(b)
@@ -294,7 +295,29 @@ func (toc *TakeoutCmd) solvePuzzle(ctx context.Context) error {
 		cat := toc.catalogs[dir]
 		jsons := gen.MapKeysSorted(cat.jsons)
 		for _, matcher := range matchers {
+			if matcher.name == "matchFastTrack" {
+				for _, json := range jsons {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					default:
+						f := strings.TrimSuffix(json, path.Ext(json))
+						if i, ok := cat.unMatchedFiles[f]; ok {
+							md := cat.jsons[json]
+							i.md = md
+							a := toc.makeAsset(ctx, dir, i, md)
+							cat.matchedFiles[f] = a
+							toc.processor.RecordNonAsset(ctx, fshelper.FSName(i.fsys, path.Join(dir, i.base)), 0, fileevent.ProcessedAssociatedMetadata, "json", json, "matcher", matcher.name)
+							delete(cat.unMatchedFiles, f)
+						}
+					}
+				}
+				continue
+			}
 			for _, json := range jsons {
+				if len(cat.unMatchedFiles) == 0 {
+					break
+				}
 				md := cat.jsons[json]
 				for f := range cat.unMatchedFiles {
 					select {
@@ -313,6 +336,7 @@ func (toc *TakeoutCmd) solvePuzzle(ctx context.Context) error {
 				}
 			}
 		}
+		cat.jsons = nil
 		toc.catalogs[dir] = cat
 		if len(cat.unMatchedFiles) > 0 {
 			files := gen.MapKeys(cat.unMatchedFiles)
@@ -326,6 +350,8 @@ func (toc *TakeoutCmd) solvePuzzle(ctx context.Context) error {
 					delete(cat.unMatchedFiles, f)
 				}
 			}
+			cat.unMatchedFiles = nil
+			toc.catalogs[dir] = cat
 		}
 	}
 	return nil
@@ -344,6 +370,7 @@ func (toc *TakeoutCmd) passTwo(ctx context.Context, gOut chan *assets.Group) err
 				return err
 			}
 		}
+		delete(toc.catalogs, dir)
 	}
 	return nil
 }
@@ -379,7 +406,7 @@ func (toc *TakeoutCmd) handleDir(ctx context.Context, dir string, gOut chan *ass
 	}
 
 	// the go routine push all asset to the in chanel for been grouped
-	in := make(chan *assets.Asset)
+	in := make(chan *assets.Asset, 64)
 	go func() {
 		defer close(in)
 

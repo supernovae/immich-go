@@ -121,16 +121,18 @@ func (uc *UpCmd) runUI(ctx context.Context, app *app.Application) error {
 							jobCount += j.JobCounts.Active
 							jobWaiting += j.JobCounts.Waiting
 						}
-						_, _, w, _ := ui.serverJobs.GetInnerRect()
-						ui.serverActivity = append(ui.serverActivity, float64(jobCount))
-						if len(ui.serverActivity) > w {
-							ui.serverActivity = ui.serverActivity[1:]
-						}
-						ui.serverJobs.SetData(ui.serverActivity)
-						ui.serverJobs.SetTitle(fmt.Sprintf("Server's jobs: active: %d, waiting: %d", jobCount, jobWaiting))
 						if jobCount > 0 {
 							ui.lastTimeServerActive.Store(time.Now().Unix())
 						}
+						uiApp.QueueUpdateDraw(func() {
+							_, _, w, _ := ui.serverJobs.GetInnerRect()
+							ui.serverActivity = append(ui.serverActivity, float64(jobCount))
+							if w > 0 && len(ui.serverActivity) > w {
+								ui.serverActivity = ui.serverActivity[len(ui.serverActivity)-w:]
+							}
+							ui.serverJobs.SetData(ui.serverActivity)
+							ui.serverJobs.SetTitle(fmt.Sprintf("Server's jobs: active: %d, waiting: %d", jobCount, jobWaiting))
+						})
 					}
 				}
 			}
@@ -193,7 +195,11 @@ func (uc *UpCmd) runUI(ctx context.Context, app *app.Application) error {
 		processGrp := errgroup.Group{}
 		processGrp.Go(func() error {
 			// Get immich asset
-			err = uc.getImmichAssets(ctx, ui.updateImmichReading)
+			err = uc.getImmichAssets(ctx, func(value, total int) {
+				uiApp.QueueUpdateDraw(func() {
+					ui.updateImmichReading(value, total)
+				})
+			})
 			if err != nil {
 				stopUI(err)
 			}
@@ -233,11 +239,12 @@ func (uc *UpCmd) runUI(ctx context.Context, app *app.Application) error {
 			messages.WriteString("Some errors have occurred. Look at the log file for details\n")
 		}
 
-		modal := newModal(messages.String())
-		pages.AddPage("modal", modal, true, false)
-		// upload is done!
-		pages.ShowPage("modal")
-
+		msgText := messages.String()
+		uiApp.QueueUpdateDraw(func() {
+			modal := newModal(msgText)
+			pages.AddPage("modal", modal, true, false)
+			pages.ShowPage("modal")
+		})
 		return err
 	})
 

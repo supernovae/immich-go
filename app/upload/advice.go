@@ -12,8 +12,8 @@ import (
 	"github.com/simulot/immich-go/internal/assets"
 	"github.com/simulot/immich-go/internal/gen/syncmap"
 	"github.com/simulot/immich-go/internal/gen/syncset"
+	"github.com/simulot/immich-go/internal/loghelper"
 )
-
 // - - go:generate stringer -type=AdviceCode
 type AdviceCode int
 
@@ -76,35 +76,67 @@ func newAssetIndex() *immichIndex {
 	}
 }
 
+func compactAsset(a *assets.Asset) *assets.Asset {
+	if a == nil {
+		return nil
+	}
+	var albums []assets.Album
+	if len(a.Albums) > 0 {
+		albums = append([]assets.Album(nil), a.Albums...)
+	}
+	return &assets.Asset{
+		ID:               a.ID,
+		Checksum:         a.Checksum,
+		OriginalFileName: a.OriginalFileName,
+		CaptureDate:      a.CaptureDate,
+		FileDate:         a.FileDate,
+		FileSize:         a.FileSize,
+		Trashed:          a.Trashed,
+		Albums:           albums,
+	}
+}
+
 // Add adds an asset to the index.
 // returns true if the asset was added, false if it was already present.
 // the returned asset is the existing asset if it was already present.
 func (ii *immichIndex) addImmichAsset(ia *immich.Asset) (*assets.Asset, bool) {
+	if ia == nil || ia.ID == "" {
+		loghelper.Warn("Skipping server asset with empty ID")
+		return nil, false
+	}
+
 	ii.lock.Lock()
 	defer ii.lock.Unlock()
-
-	if ia.ID == "" {
-		panic("asset ID is empty")
-	}
 
 	if existing, ok := ii.immichAssets.Load(ia.ID); ok {
 		return existing, false
 	}
-	a := ia.AsAsset()
+	a := compactAsset(ia.AsAsset())
 	return ii.add(a, false), true
 }
 
 func (ii *immichIndex) addLocalAsset(ia *assets.Asset) (*assets.Asset, bool) {
+	if ia == nil || ia.ID == "" {
+		loghelper.Warn("Skipping local asset with empty ID")
+		return ia, false
+	}
+
 	ii.lock.Lock()
 	defer ii.lock.Unlock()
 
 	if existing, ok := ii.immichAssets.Load(ia.ID); ok {
+		if ia.Checksum != "" {
+			ii.uploadsChecksum.Add(ia.Checksum)
+		}
 		return existing, false
 	}
-	if existing, ok := ii.byChecksum.Load(ia.Checksum); ok {
-		return existing, false
+	if ia.Checksum != "" {
+		if existing, ok := ii.byChecksum.Load(ia.Checksum); ok {
+			ii.uploadsChecksum.Add(ia.Checksum)
+			return existing, false
+		}
 	}
-	return ii.add(ia, true), true
+	return ii.add(compactAsset(ia), true), true
 }
 
 func (ii *immichIndex) getByID(id string) *assets.Asset {
@@ -117,30 +149,24 @@ func (ii *immichIndex) len() int {
 }
 
 func (ii *immichIndex) add(a *assets.Asset, local bool) *assets.Asset {
-	if a.ID == "" {
-		panic("asset ID is empty")
-	}
-	if a.Checksum == "" {
-		panic("asset checksum is empty")
-	}
-
-	if _, ok := ii.byChecksum.Load(a.Checksum); ok {
-		panic("asset checksum already exists")
-	}
-
-	if ii.uploadsChecksum.Contains(a.Checksum) {
-		panic("asset checksum already exists in uploads")
+	if a == nil || a.ID == "" {
+		loghelper.Warn("Cannot index asset with empty ID")
+		return a
 	}
 
 	atomic.AddInt64(&ii.assetNumber, 1)
 	ii.immichAssets.Store(a.ID, a)
-	ii.byChecksum.Store(a.Checksum, a)
-	filename := a.OriginalFileName
 
-	if local {
-		ii.uploadsChecksum.Add(a.Checksum)
+	if a.Checksum != "" {
+		if _, ok := ii.byChecksum.Load(a.Checksum); !ok {
+			ii.byChecksum.Store(a.Checksum, a)
+		}
+		if local {
+			ii.uploadsChecksum.Add(a.Checksum)
+		}
 	}
 
+	filename := a.OriginalFileName
 	l, _ := ii.byName.Load(filename)
 	l = append(l, a.ID)
 	ii.byName.Store(filename, l)
@@ -148,26 +174,28 @@ func (ii *immichIndex) add(a *assets.Asset, local bool) *assets.Asset {
 }
 
 func (ii *immichIndex) replaceAsset(newA *assets.Asset, oldA *assets.Asset) *assets.Asset {
-	if newA.ID == "" {
-		panic("asset ID is empty")
-	}
-	if newA.Checksum == "" {
-		panic("asset checksum is empty")
+	if newA == nil || newA.ID == "" {
+		loghelper.Warn("Cannot replace asset with empty ID")
+		return newA
 	}
 	ii.lock.Lock()
 	defer ii.lock.Unlock()
-	oldA.Trashed = true
-	ii.immichAssets.Store(newA.ID, newA)     // Store the new asset
-	ii.byChecksum.Store(newA.Checksum, newA) // Store the new SHA1
-	ii.uploadsChecksum.Add(newA.Checksum)
+	if oldA != nil {
+		oldA.Trashed = true
+	}
+	compacted := compactAsset(newA)
+	ii.immichAssets.Store(compacted.ID, compacted)
+	if compacted.Checksum != "" {
+		ii.byChecksum.Store(compacted.Checksum, compacted)
+		ii.uploadsChecksum.Add(compacted.Checksum)
+	}
 
-	filename := newA.OriginalFileName
+	filename := compacted.OriginalFileName
 	l, _ := ii.byName.Load(filename)
-	l = append(l, newA.ID)
+	l = append(l, compacted.ID)
 	ii.byName.Store(filename, l)
-	return newA
+	return compacted
 }
-
 func (ii *immichIndex) isAlreadyProcessed(checksum string) bool {
 	return ii.uploadsChecksum.Contains(checksum)
 }

@@ -22,27 +22,25 @@ type serverError interface {
 	lines() []string
 }
 
-type serverErrorV2 struct {
-	Error         string `json:"error"`
-	StatusCode    int    `json:"statusCode"`
-	Message       string `json:"message"`
-	CorrelationID string `json:"correlationId"`
-}
-
-func (e serverErrorV2) lines() []string {
-	return []string{e.Message}
-}
-
 type serverErrorV3 struct {
-	Message       string          `json:"message"`
+	Message       any             `json:"message"`
 	Errors        json.RawMessage `json:"errors"`
 	CorrelationID string          `json:"-"` // from the X-Correlation-ID header
 }
 
 func (e serverErrorV3) lines() []string {
 	var out []string
-	if e.Message != "" {
-		out = append(out, e.Message)
+	switch m := e.Message.(type) {
+	case string:
+		if m != "" {
+			out = append(out, m)
+		}
+	case []any:
+		for _, item := range m {
+			if s, ok := item.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
 	}
 	if len(e.Errors) > 0 {
 		out = append(out, string(e.Errors))

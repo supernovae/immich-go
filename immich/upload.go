@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/simulot/immich-go/internal/assets"
@@ -40,6 +41,16 @@ func (ic *ImmichClient) uploadAsset(ctx context.Context, la *assets.Asset, endPo
 		}, nil
 	}
 
+	if ic.UploadDelay > 0 {
+		timer := time.NewTimer(ic.UploadDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return AssetResponse{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+
 	var ar AssetResponse
 	ext := path.Ext(la.OriginalFileName)
 	if strings.TrimSuffix(la.OriginalFileName, ext) == "" {
@@ -56,6 +67,28 @@ func (ic *ImmichClient) uploadAsset(ctx context.Context, la *assets.Asset, endPo
 	default:
 		return ar, fmt.Errorf("type file not supported: %s", path.Ext(la.OriginalFileName))
 	}
+
+	maxAttempts := max(1, ic.Retries+1)
+	var lastErr error
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			if err := ic.retryWait(ctx, attempt-1); err != nil {
+				return ar, err
+			}
+		}
+		ar, lastErr = ic.uploadAssetOnce(ctx, la, endPoint, replaceID, ext, mtype)
+		if lastErr == nil {
+			return ar, nil
+		}
+		if !isRetryableError(lastErr) || ctx.Err() != nil {
+			return ar, lastErr
+		}
+	}
+	return ar, lastErr
+}
+
+func (ic *ImmichClient) uploadAssetOnce(ctx context.Context, la *assets.Asset, endPoint, replaceID, ext, mtype string) (AssetResponse, error) {
+	var ar AssetResponse
 
 	f, err := la.OpenFile()
 	if err != nil {
@@ -74,32 +107,32 @@ func (ic *ImmichClient) uploadAsset(ctx context.Context, la *assets.Asset, endPo
 
 	errChan := make(chan error, 1)
 	go func() {
+		var gErr error
 		defer func() {
-			m.Close()
-			pw.Close()
+			closeErr := m.Close()
+			if gErr == nil {
+				gErr = closeErr
+			}
+			_ = pw.CloseWithError(gErr)
+			errChan <- gErr
 		}()
 
-		var gErr error
 		gErr = ic.writeMultipartFields(m, callValues)
 		if gErr != nil {
-			errChan <- gErr
 			return
 		}
 
 		gErr = ic.writeFilePart(m, f, la.OriginalFileName, mtype)
 		if gErr != nil {
-			errChan <- gErr
 			return
 		}
 
 		if la.FromSideCar != nil && strings.HasSuffix(strings.ToLower(la.FromSideCar.File.Name()), ".xmp") {
 			gErr = ic.writeSideCarPart(m, la)
 			if gErr != nil {
-				errChan <- gErr
 				return
 			}
 		}
-		errChan <- nil
 	}()
 
 	var errCall error
@@ -111,12 +144,17 @@ func (ic *ImmichClient) uploadAsset(ctx context.Context, la *assets.Asset, endPo
 		errCall = ic.newServerCall(ctx, EndPointAssetReplace).
 			do(putRequest("/assets/"+replaceID+"/original", setContextValue(callValues), setAcceptJSON(), setImmichChecksum(la), setContentType(m.FormDataContentType()), setBody(body)), responseJSON(&ar))
 	}
-	if ar.Status == "duplicate" && errors.Is(err, io.ErrClosedPipe) {
-		err = nil // immich closes the connection when we upload the x-immich-checksum header and it finds a duplicate
-	}
+	// Always unblock the pipe writer if the HTTP client exited early
+	_ = body.CloseWithError(errCall)
 	gErr := <-errChan
-	err = errors.Join(err, errCall, gErr)
-	return ar, err
+	if (ar.Status == UploadDuplicate || errCall != nil) && errors.Is(gErr, io.ErrClosedPipe) {
+		// Immich closes the connection early when x-immich-checksum matches a duplicate or when returning an HTTP error
+		gErr = nil
+	}
+	if ar.Status == UploadDuplicate && errors.Is(errCall, io.ErrClosedPipe) {
+		errCall = nil
+	}
+	return ar, errors.Join(errCall, gErr)
 }
 
 func (ic *ImmichClient) prepareCallValues(la *assets.Asset, s fs.FileInfo, ext, mtype string) map[string]string {

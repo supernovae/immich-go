@@ -3,8 +3,8 @@ package upload
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
-
 	"github.com/simulot/immich-go/adapters"
 	"github.com/simulot/immich-go/adapters/folder"
 	"github.com/simulot/immich-go/adapters/fromimmich"
@@ -75,7 +75,7 @@ type UpCmd struct {
 	DebugCounters     bool                                 // Enable CSV action counters per file
 	albumsCache       *cache.CollectionCache[assets.Album] // List of albums present on the server
 	tagsCache         *cache.CollectionCache[assets.Tag]   // List of tags present on the server
-	finished          bool                                 // the finish task has been run
+	finished          atomic.Bool                          // the finish task has been run
 	infoCollector     *filenames.InfoCollector             // Collects information about the files being processed
 }
 

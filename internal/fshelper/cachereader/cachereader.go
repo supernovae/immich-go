@@ -30,7 +30,8 @@ func NewCacheReader(name string, rc io.ReadCloser) (*CacheReader, string, error)
 	c := &CacheReader{}
 	if f, ok := rc.(osfs.OSFS); ok {
 		c.name = f.Name()
-		c.tmpFile = f
+		_ = f.Close()
+		debugfiles.TrackCloseFile(f)
 	} else {
 		d := os.Getenv("IMMICHGO_TEMPDIR")
 		if d == "" {
@@ -60,6 +61,9 @@ func NewCacheReader(name string, rc io.ReadCloser) (*CacheReader, string, error)
 			_ = os.Remove(c.name)
 			return nil, "", err
 		}
+		_ = c.tmpFile.Close()
+		debugfiles.TrackCloseFile(c.tmpFile)
+		c.tmpFile = nil
 		rc.Close()
 		debugfiles.TrackCloseFile(rc)
 		c.shouldRemove = true
@@ -79,10 +83,14 @@ func (cr *CacheReader) OpenFile() (*tempFile, error) {
 
 // Close closes the temporary file only if it was created by NewCacheReader
 func (cr *CacheReader) Close() error {
-	debugfiles.TrackCloseFile(cr.tmpFile)
-	err := cr.tmpFile.Close()
+	var err error
+	if cr.tmpFile != nil {
+		debugfiles.TrackCloseFile(cr.tmpFile)
+		err = cr.tmpFile.Close()
+		cr.tmpFile = nil
+	}
 	if err == nil && cr.shouldRemove {
-		// the source is already closed
+		cr.shouldRemove = false
 		loghelper.Debug("CacheReader: remove temporary file", "name", cr.name)
 		return os.Remove(cr.name)
 	}

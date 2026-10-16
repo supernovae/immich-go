@@ -32,7 +32,9 @@ type Client struct {
 	APITraceWriterName        string         `mapstructure:"api_trace_writer_name" json:"api_trace_writer_name" toml:"api_trace_writer_name" yaml:"api_trace_writer_name"`                             // API trace log name
 	User                      immich.User    `mapstructure:"user" json:"user" toml:"user" yaml:"user"`                                                                                                 // User info corresponding to the API key
 	PauseImmichBackgroundJobs bool           `mapstructure:"pause_immich_background_jobs" json:"pause_immich_background_jobs" toml:"pause_immich_background_jobs" yaml:"pause_immich_background_jobs"` // Pause Immich background jobs
-
+	APIRetries                int            `mapstructure:"api_retries" json:"api_retries" toml:"api_retries" yaml:"api_retries"`                                                                         // Number of API retry attempts on transient errors
+	APIRetryDelay             time.Duration  `mapstructure:"api_retry_delay" json:"api_retry_delay" toml:"api_retry_delay" yaml:"api_retry_delay"`                                                         // Base delay between API retries
+	UploadDelay               time.Duration  `mapstructure:"upload_delay" json:"upload_delay" toml:"upload_delay" yaml:"upload_delay"`                                                                     // Pacing delay before each asset upload
 	TZ          *time.Location         // Time zone to use
 	Immich      immich.ImmichInterface // Immich client
 	AdminImmich immich.ImmichInterface // Immich client for admin
@@ -61,6 +63,9 @@ func (client *Client) RegisterFlags(flags *pflag.FlagSet, prefix string) {
 	flags.StringVar(&client.DeviceUUID, prefix+"device-uuid", client.DeviceUUID, "Set a device UUID")
 	flags.BoolVar(&client.DryRun, prefix+"dry-run", false, "Simulate all actions")
 	flags.StringVar(&client.TimeZone, prefix+"time-zone", client.TimeZone, "Override the system time zone")
+	flags.IntVar(&client.APIRetries, prefix+"api-retries", 3, "Number of retry attempts on transient server errors")
+	flags.DurationVar(&client.APIRetryDelay, prefix+"api-retry-delay", 500*time.Millisecond, "Base delay between retry attempts")
+	flags.DurationVar(&client.UploadDelay, prefix+"upload-delay", 0, "Optional pacing delay before each asset upload (e.g. 50ms)")
 }
 
 // Open establishes a connection to the Immich server.
@@ -139,6 +144,8 @@ func (client *Client) Open(ctx context.Context, app *Application) error {
 		immich.OptionVerifySSL(client.SkipSSL),
 		immich.OptionConnectionTimeout(client.ClientTimeout),
 		immich.OptionDryRun(client.DryRun),
+		immich.OptionRetries(client.APIRetries, client.APIRetryDelay),
+		immich.OptionUploadDelay(client.UploadDelay),
 	)
 	if err != nil {
 		return err
@@ -154,6 +161,7 @@ func (client *Client) Open(ctx context.Context, app *Application) error {
 		client.AdminAPIKey,
 		immich.OptionVerifySSL(client.SkipSSL),
 		immich.OptionConnectionTimeout(adminTime),
+		immich.OptionRetries(client.APIRetries, client.APIRetryDelay),
 		// no trace pulling job status
 	)
 	if err != nil {

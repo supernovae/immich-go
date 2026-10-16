@@ -51,6 +51,11 @@ func (uc *UpCmd) saveTags(ctx context.Context, tag assets.Tag, ids []string) (as
 			uc.app.Log().Error("failed to create tag", "err", err, "tag", tag.Name)
 			return tag, err
 		}
+		if len(r) == 0 {
+			err := errors.New("server returned empty tag response")
+			uc.app.Log().Error("failed to create tag", "err", err, "tag", tag.Name)
+			return tag, err
+		}
 		uc.app.Log().Info("created tag", "tag", tag.Value)
 		tag.ID = r[0].ID
 	}
@@ -93,20 +98,24 @@ func (uc *UpCmd) resumeJobs(_ context.Context) error {
 }
 
 func (uc *UpCmd) finishing(ctx context.Context) error {
-	if uc.finished {
+	if !uc.finished.CompareAndSwap(false, true) {
 		return nil
 	}
-	defer func() { uc.finished = true }()
 	// do waiting operations
-	uc.albumsCache.Close()
-	uc.tagsCache.Close()
-
-	// Resume immich background jobs if requested
-	err := uc.resumeJobs(ctx)
-	if err != nil {
-		return err
+	if uc.albumsCache != nil {
+		uc.albumsCache.Close()
+	}
+	if uc.tagsCache != nil {
+		uc.tagsCache.Close()
 	}
 
+	// Resume immich background jobs if requested
+	if uc.client.PauseImmichBackgroundJobs {
+		err := uc.resumeJobs(ctx)
+		if err != nil {
+			return err
+		}
+	}
 	// Generate FileProcessor report
 	if uc.app.FileProcessor() != nil {
 		report := uc.app.FileProcessor().GenerateReport()
@@ -138,11 +147,12 @@ func (uc *UpCmd) upload(ctx context.Context, adapter adapters.Reader) error {
 			fmt.Println(uc.app.FileProcessor().GenerateReport())
 		}
 	}()
+	flushCtx := context.WithoutCancel(ctx)
 	uc.albumsCache = cache.NewCollectionCache(50, func(album assets.Album, ids []string) (assets.Album, error) {
-		return uc.saveAlbum(ctx, album, ids)
+		return uc.saveAlbum(flushCtx, album, ids)
 	})
 	uc.tagsCache = cache.NewCollectionCache(50, func(tag assets.Tag, ids []string) (assets.Tag, error) {
-		return uc.saveTags(ctx, tag, ids)
+		return uc.saveTags(flushCtx, tag, ids)
 	})
 
 	uc.adapter = adapter
@@ -270,10 +280,7 @@ func (uc *UpCmd) uploadLoop(ctx context.Context, groupChan chan *assets.Group) e
 				workers.Submit(func() {
 					err := uc.handleGroup(ctx, g)
 					if err != nil {
-						err = uc.app.ProcessError(err)
-						if err != nil {
-							cancel(err)
-						}
+						cancel(err)
 					}
 				})
 			}
@@ -313,15 +320,22 @@ func (uc *UpCmd) handleGroup(ctx context.Context, g *assets.Group) error {
 	// Upload assets from the group
 	for _, a := range g.Assets {
 		err := uc.handleAsset(ctx, a)
-		errGroup = errors.Join(err)
+		if err != nil {
+			if procErr := uc.app.ProcessError(err); procErr != nil {
+				errGroup = errors.Join(errGroup, procErr)
+				break
+			}
+		}
 	}
 
 	// Manage groups
 	// after the filtering and the upload, we can stack the assets
-
 	if len(g.Assets) > 1 && g.Grouping != assets.GroupByNone {
 		client := uc.client.Immich.(immich.ImmichStackInterface)
-		ids := []string{g.Assets[g.CoverIndex].ID}
+		ids := make([]string, 0, len(g.Assets))
+		if g.CoverIndex >= 0 && g.CoverIndex < len(g.Assets) && g.Assets[g.CoverIndex].ID != "" {
+			ids = append(ids, g.Assets[g.CoverIndex].ID)
+		}
 		for i, a := range g.Assets {
 			// Record stacking event
 			uc.app.FileProcessor().RecordNonAsset(ctx, g.Assets[i].File, 0, fileevent.ProcessedStacked)
@@ -336,7 +350,6 @@ func (uc *UpCmd) handleGroup(ctx context.Context, g *assets.Group) error {
 			}
 		}
 	}
-
 	return errGroup
 }
 
@@ -464,9 +477,10 @@ func (uc *UpCmd) uploadAsset(ctx context.Context, a *assets.Asset) (string, erro
 	// // DEBGUG
 	//  if theID, ok := uc.assetIndex.byI
 
+	uc.assetIndex.addLocalAsset(a)
+
 	if a.FromApplication != nil && ar.Status != immich.StatusDuplicate {
 		// metadata from application (immich or google photos) are forced.
-		// if a.Description != "" || (a.Latitude != 0 && a.Longitude != 0) || a.Rating != 0 || !a.CaptureDate.IsZero() {
 		a.UseMetadata(a.FromApplication)
 		_, err := uc.client.Immich.UpdateAsset(ctx, a.ID, immich.UpdAssetField{
 			Description:      a.Description,
@@ -476,14 +490,12 @@ func (uc *UpCmd) uploadAsset(ctx context.Context, a *assets.Asset) (string, erro
 			DateTimeOriginal: a.CaptureDate,
 		})
 		if err != nil {
-			// Record metadata update error
-			uc.app.FileProcessor().RecordAssetError(ctx, a.File, int64(a.FileSize), fileevent.ErrorServerError, err)
-			return "", err
+			uc.app.Log().Warn("failed to update uploaded asset metadata", "file", a.File, "err", err)
+		} else {
+			// Record successful metadata update
+			uc.app.FileProcessor().Logger().Record(ctx, fileevent.ProcessedMetadataUpdated, a.File)
 		}
-		// Record successful metadata update
-		uc.app.FileProcessor().Logger().Record(ctx, fileevent.ProcessedMetadataUpdated, a.File)
 	}
-	uc.assetIndex.addLocalAsset(a)
 	return ar.Status, nil
 }
 
@@ -504,22 +516,20 @@ func (uc *UpCmd) replaceAsset(ctx context.Context, newAsset, oldAsset *assets.As
 		return immich.UploadDuplicate, nil
 	}
 
+	uc.assetIndex.replaceAsset(newAsset, oldAsset)
+
 	// 2. copy metadata from existing asset to the new asset
 	err = uc.client.Immich.CopyAsset(ctx, oldAsset.ID, ar.ID)
 	if err != nil {
-		// Record copy error
-		uc.app.FileProcessor().RecordAssetError(ctx, newAsset.File, int64(newAsset.FileSize), fileevent.ErrorServerError, err)
-		return "", err // Must signal the error to the caller
+		uc.app.Log().Warn("failed to copy metadata to replacement asset", "file", newAsset.File, "err", err)
+		return "", nil
 	}
 
 	// 3. Delete the existing asset
 	err = uc.client.Immich.DeleteAssets(ctx, []string{oldAsset.ID}, true)
 	if err != nil {
-		// Record delete error
-		uc.app.FileProcessor().RecordAssetError(ctx, newAsset.File, int64(newAsset.FileSize), fileevent.ErrorServerError, err)
-		return "", err // Must signal the error to the caller
+		uc.app.Log().Warn("failed to delete replaced server asset", "file", newAsset.File, "oldID", oldAsset.ID, "err", err)
 	}
-	uc.assetIndex.replaceAsset(newAsset, oldAsset)
 	// Record successful upgrade
 	// uc.app.FileProcessor().RecordAssetProcessed(ctx, newAsset.File, int64(newAsset.FileSize), fileevent.ProcessedUploadUpgraded)
 	return "", nil

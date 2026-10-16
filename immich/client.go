@@ -24,8 +24,9 @@ type ImmichClient struct {
 	endPoint       string        // Server API url
 	key            string        // User KEY
 	DeviceUUID     string        // Device
-	Retries        int           // Number of attempts on 500 errors
-	RetriesDelay   time.Duration // Duration between retries
+	Retries        int           // Number of retry attempts on transient/5xx errors
+	RetriesDelay   time.Duration // Base duration between retries
+	UploadDelay    time.Duration // Optional pacing delay between uploads
 	apiTraceWriter io.Writer     // If not nil, logs API calls to this writer
 
 	supportedMediaTypes filetypes.SupportedMedia // Server's list of supported medias
@@ -92,6 +93,23 @@ func OptionDryRun(dryRun bool) clientOption {
 	}
 }
 
+func OptionRetries(retries int, delay time.Duration) clientOption {
+	return func(ic *ImmichClient) error {
+		ic.Retries = max(retries, 0)
+		if delay > 0 {
+			ic.RetriesDelay = delay
+		}
+		return nil
+	}
+}
+
+func OptionUploadDelay(d time.Duration) clientOption {
+	return func(ic *ImmichClient) error {
+		ic.UploadDelay = max(d, 0)
+		return nil
+	}
+}
+
 // Create a new ImmichClient
 func NewImmichClient(endPoint string, key string, options ...clientOption) (*ImmichClient, error) {
 	var err error
@@ -123,8 +141,8 @@ func NewImmichClient(endPoint string, key string, options ...clientOption) (*Imm
 		},
 		key:          key,
 		DeviceUUID:   deviceUUID,
-		Retries:      1,
-		RetriesDelay: time.Second * 1,
+		Retries:      3,
+		RetriesDelay: 500 * time.Millisecond,
 	}
 
 	ic.client = &http.Client{

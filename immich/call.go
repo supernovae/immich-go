@@ -7,11 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"mime"
 	"net/http"
 	"net/url"
 	"sync/atomic"
-
+	"time"
 	"github.com/simulot/immich-go/internal/assets"
 	"github.com/simulot/immich-go/internal/fshelper"
 )
@@ -66,6 +67,7 @@ type serverCall struct {
 	err                error
 	ctx                context.Context
 	hasResponseHandler bool
+	hasStreamBody      bool
 }
 
 func (ic *ImmichClient) newServerCall(ctx context.Context, api string) *serverCall {
@@ -101,12 +103,6 @@ func (sc *serverCall) decodeServerError(resp *http.Response) serverError {
 		if isJSON(resp.Header.Get("Content-Type")) {
 			body, _ = io.ReadAll(resp.Body)
 		}
-	}
-
-	if v := sc.ic.serverVersion; v != nil && v.Major() < 3 {
-		var e serverErrorV2
-		json.Unmarshal(body, &e)
-		return e
 	}
 
 	e := serverErrorV3{CorrelationID: resp.Header.Get("X-Correlation-ID")}
@@ -190,49 +186,120 @@ func putRequest(url string, opts ...serverRequestOption) requestFunction {
 	}
 }
 
-func (sc *serverCall) do(fnRequest requestFunction, opts ...serverResponseOption) error {
-	var (
-		resp *http.Response
-		err  error
-	)
-
-	req := fnRequest(sc)
-	if sc.err != nil || req == nil {
-		return sc.Err(req, nil, nil)
+func isRetryableStatus(status int) bool {
+	switch status {
+	case http.StatusRequestTimeout,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
 	}
+}
 
-	resp, err = sc.ic.client.Do(req)
-	// any non nil error must be returned
-	if err != nil {
-		sc.err = err
-		return sc.Err(req, nil, nil)
+func isRetryableError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
 	}
-
-	// Any StatusCode above 300 denotes a problem, we expect a JSON with the server's error
-	if resp.StatusCode >= 300 {
-		return sc.Err(req, resp, sc.decodeServerError(resp))
-	}
-
-	// We have a success
-	for _, opt := range opts {
-		if opt != nil {
-			_ = sc.joinError(opt(sc, resp))
+	var ce callError
+	if errors.As(err, &ce) {
+		if ce.status == 0 {
+			return ce.err != nil
 		}
+		return isRetryableStatus(ce.status)
 	}
-	if !sc.hasResponseHandler && resp.Body != nil {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+	return true
+}
+
+func (ic *ImmichClient) retryWait(ctx context.Context, attempt int) error {
+	base := ic.RetriesDelay
+	if base <= 0 {
+		base = 500 * time.Millisecond
 	}
-	if sc.err != nil {
-		return sc.Err(req, resp, nil)
+	backoff := base * time.Duration(1<<min(attempt, 5))
+	jitter := time.Duration(rand.Int64N(int64(base)/2 + 1))
+	timer := time.NewTimer(backoff + jitter)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
-	return nil
+}
+
+func (sc *serverCall) do(fnRequest requestFunction, opts ...serverResponseOption) error {
+	maxAttempts := 1
+	if sc.ic != nil && sc.ic.Retries > 0 && sc.endPoint != EndPointGetJobs {
+		maxAttempts = sc.ic.Retries + 1
+	}
+
+	var lastErr error
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			if err := sc.ic.retryWait(sc.ctx, attempt-1); err != nil {
+				sc.err = err
+				return sc.Err(nil, nil, nil)
+			}
+		}
+
+		sc.err = nil
+		sc.hasResponseHandler = false
+		req := fnRequest(sc)
+		if sc.err != nil || req == nil {
+			if req != nil && req.Body != nil {
+				_ = req.Body.Close()
+			}
+			return sc.Err(req, nil, nil)
+		}
+
+		resp, err := sc.ic.client.Do(req)
+		if err != nil {
+			sc.err = err
+			lastErr = sc.Err(req, nil, nil)
+			if !sc.hasStreamBody && attempt+1 < maxAttempts && sc.ctx.Err() == nil {
+				continue
+			}
+			return lastErr
+		}
+
+		if resp.StatusCode >= 300 {
+			lastErr = sc.Err(req, resp, sc.decodeServerError(resp))
+			if !sc.hasStreamBody && attempt+1 < maxAttempts && isRetryableStatus(resp.StatusCode) && sc.ctx.Err() == nil {
+				continue
+			}
+			return lastErr
+		}
+
+		for _, opt := range opts {
+			if opt != nil {
+				_ = sc.joinError(opt(sc, resp))
+			}
+		}
+		if !sc.hasResponseHandler && resp.Body != nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		if sc.err != nil {
+			lastErr = sc.Err(req, resp, nil)
+			if !sc.hasStreamBody && attempt+1 < maxAttempts && sc.ctx.Err() == nil {
+				continue
+			}
+			return lastErr
+		}
+		return nil
+	}
+	return lastErr
 }
 
 type serverRequestOption func(sc *serverCall, req *http.Request) error
 
 func setBody(body io.ReadCloser) serverRequestOption {
 	return func(sc *serverCall, req *http.Request) error {
+		sc.hasStreamBody = true
 		req.Body = body
 		return nil
 	}
@@ -271,15 +338,17 @@ func setAPIKey() serverRequestOption {
 
 func setJSONBody(object any) serverRequestOption {
 	return func(sc *serverCall, req *http.Request) error {
-		b := bytes.NewBuffer(nil)
-		enc := json.NewEncoder(b)
-		err := enc.Encode(object)
+		data, err := json.Marshal(object)
 		if err != nil {
 			return err
 		}
-		req.Body = io.NopCloser(b)
+		req.Body = io.NopCloser(bytes.NewReader(data))
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(data)), nil
+		}
+		req.ContentLength = int64(len(data))
 		req.Header.Set("Content-Type", "application/json")
-		return err
+		return nil
 	}
 }
 

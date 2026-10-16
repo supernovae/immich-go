@@ -24,6 +24,8 @@ func (a *Asset) OpenFile() (osfs.OSFS, error) {
 		// Create a cache reader from the FS.File
 		cr, sha1, err := cachereader.NewCacheReader(a.File.FullName(), f)
 		if err != nil {
+			_ = f.Close()
+			debugfiles.TrackCloseFile(f)
 			return nil, err
 		}
 		a.cacheReader = cr
@@ -39,7 +41,9 @@ func (a *Asset) Close() error {
 	if a.cacheReader == nil {
 		return nil
 	}
-	return a.cacheReader.Close()
+	cr := a.cacheReader
+	a.cacheReader = nil
+	return cr.Close()
 }
 
 /*

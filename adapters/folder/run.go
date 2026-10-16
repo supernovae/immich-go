@@ -61,7 +61,7 @@ func (ifc *ImportFolderCmd) run(cmd *cobra.Command, args []string, app *app.Appl
 
 	// Start the workers
 	ifc.pool = worker.NewPool(ifc.app.ConcurrentTask)
-
+	defer ifc.pool.Stop()
 	// create the adapter for folders
 	ifc.supportedMedia = ifc.app.GetSupportedMedia()
 
@@ -101,7 +101,7 @@ func (ifc *ImportFolderCmd) run(cmd *cobra.Command, args []string, app *app.Appl
 const icloudMetadataExt = ".csv"
 
 func (ifc *ImportFolderCmd) Browse(ctx context.Context) chan *assets.Group {
-	gOut := make(chan *assets.Group)
+	gOut := make(chan *assets.Group, 64)
 	go func() {
 		defer func() {
 			close(gOut)
@@ -125,13 +125,11 @@ func (ifc *ImportFolderCmd) Browse(ctx context.Context) chan *assets.Group {
 
 func (ifc *ImportFolderCmd) concurrentParseDir(ctx context.Context, fsys fs.FS, dir string, gOut chan *assets.Group) {
 	ifc.wg.Add(1)
-	ctx, cancel := context.WithCancelCause(ctx)
 	go ifc.pool.Submit(func() {
 		defer ifc.wg.Done()
 		err := ifc.parseDir(ctx, fsys, dir, gOut)
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			ifc.app.Log().Error(err.Error())
-			cancel(err)
 		}
 	})
 }
@@ -152,7 +150,20 @@ func (ifc *ImportFolderCmd) parseDir(ctx context.Context, fsys fs.FS, dir string
 	default:
 		entries, err = fs.ReadDir(fsys, dir)
 		if err != nil {
-			return err
+			ifc.processor.RecordNonAsset(ctx, fshelper.FSName(fsys, dir), 0, fileevent.ErrorFileAccess, "error", err.Error())
+			return ifc.app.ProcessError(err)
+		}
+	}
+
+	dirSidecars := make(map[string]string)
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			base := entry.Name()
+			ext := filepath.Ext(base)
+			key := strings.TrimSuffix(base, ext) + strings.ToLower(ext)
+			if _, exists := dirSidecars[key]; !exists {
+				dirSidecars[key] = path.Join(dir, base)
+			}
 		}
 	}
 
@@ -271,17 +282,22 @@ func (ifc *ImportFolderCmd) parseDir(ctx context.Context, fsys fs.FS, dir string
 			return ctx.Err()
 		default:
 			// we have a file to process - it's an asset (image or video)
+			code := fileevent.DiscoveredImage
+			if mediaType == filetypes.TypeVideo {
+				code = fileevent.DiscoveredVideo
+			}
 			a, err := ifc.assetFromFile(ctx, fsys, name)
 			if err != nil {
-				ifc.processor.RecordAssetError(ctx, fshelper.FSName(fsys, name), 0, fileevent.ErrorFileAccess, err)
-				return err
+				fileRef := fshelper.FSName(fsys, name)
+				ifc.processor.RecordAssetDiscovered(ctx, fileRef, 0, code)
+				ifc.processor.RecordAssetError(ctx, fileRef, 0, fileevent.ErrorFileAccess, err)
+				if procErr := ifc.app.ProcessError(err); procErr != nil {
+					return procErr
+				}
+				continue
 			}
 			if a != nil {
 				// Record asset discovery with size
-				code := fileevent.DiscoveredImage
-				if mediaType == filetypes.TypeVideo {
-					code = fileevent.DiscoveredVideo
-				}
 				ifc.processor.RecordAssetDiscovered(ctx, a.File, int64(a.FileSize), code)
 				as = append(as, a)
 			}
@@ -304,7 +320,7 @@ func (ifc *ImportFolderCmd) parseDir(ctx context.Context, fsys fs.FS, dir string
 		}
 	}
 
-	in := make(chan *assets.Asset)
+	in := make(chan *assets.Asset, 64)
 	go func() {
 		defer close(in)
 
@@ -321,8 +337,8 @@ func (ifc *ImportFolderCmd) parseDir(ctx context.Context, fsys fs.FS, dir string
 
 		for _, a := range as {
 			// check the presence of a JSON file
-			jsonName, err := checkExistSideCar(fsys, a.File.Name(), ".json")
-			if err == nil && jsonName != "" {
+			jsonName := findSideCarInDir(dirSidecars, a.File.Name(), ".json")
+			if jsonName != "" {
 				buf, err := fs.ReadFile(fsys, jsonName)
 				if err != nil {
 					ifc.processor.RecordNonAsset(ctx, fshelper.FSName(fsys, jsonName), 0, fileevent.ErrorFileAccess, "error", err.Error())
@@ -345,8 +361,8 @@ func (ifc *ImportFolderCmd) parseDir(ctx context.Context, fsys fs.FS, dir string
 				}
 			}
 			// check the presence of a XMP file
-			xmpName, err := checkExistSideCar(fsys, a.File.Name(), ".xmp")
-			if err == nil && xmpName != "" {
+			xmpName := findSideCarInDir(dirSidecars, a.File.Name(), ".xmp")
+			if xmpName != "" {
 				buf, err := fs.ReadFile(fsys, xmpName)
 				if err != nil {
 					ifc.processor.RecordNonAsset(ctx, fshelper.FSName(fsys, xmpName), 0, fileevent.ErrorFileAccess, "error", err.Error())
@@ -377,12 +393,10 @@ func (ifc *ImportFolderCmd) parseDir(ctx context.Context, fsys fs.FS, dir string
 				}
 				if a.CaptureDate.IsZero() {
 					// no date in XMP, JSON, try reading the metadata
-					f, err := a.OpenFile()
+					f, err := a.File.Open()
 					if err == nil {
 						md, err := exif.GetMetaData(f, a.Ext, ifc.tz)
-						if err != nil {
-							// Metadata extraction failed, but continue processing
-						} else {
+						if err == nil {
 							a.FromSourceFile = a.UseMetadata(md)
 						}
 						if (md == nil || md.DateTaken.IsZero()) && !a.Taken.IsZero() && ifc.TakeDateFromFilename {
@@ -392,14 +406,14 @@ func (ifc *ImportFolderCmd) parseDir(ctx context.Context, fsys fs.FS, dir string
 							}
 							a.CaptureDate = a.FromApplication.DateTaken
 						}
-						f.Close()
+						_ = f.Close()
 					}
 				}
 			}
 
 			if !ifc.InclusionFlags.DateRange.InRange(a.CaptureDate) {
 				a.Close()
-				ifc.processor.RecordAssetDiscardedImmediately(ctx, a.File, int64(a.FileSize), fileevent.DiscardedFiltered, "asset outside date range")
+				ifc.processor.RecordAssetDiscarded(ctx, a.File, int64(a.FileSize), fileevent.DiscardedFiltered, "asset outside date range")
 				continue
 			}
 
@@ -475,39 +489,21 @@ func (ifc *ImportFolderCmd) parseDir(ctx context.Context, fsys fs.FS, dir string
 	return nil
 }
 
-func checkExistSideCar(fsys fs.FS, name string, ext string) (string, error) {
-	ext2 := ""
-	for _, r := range ext {
-		if r == '.' {
-			ext2 += "."
-			continue
-		}
-		ext2 += "[" + strings.ToLower(string(r)) + strings.ToUpper(string(r)) + "]"
+func findSideCarInDir(dirSidecars map[string]string, assetPath string, ext string) string {
+	lowExt := strings.ToLower(ext)
+	base := path.Base(assetPath)
+	if p, ok := dirSidecars[base+lowExt]; ok {
+		return p
 	}
-
-	base := name
-	l, err := fs.Glob(fsys, base+ext2)
-	if err != nil {
-		return "", err
+	mediaExt := path.Ext(base)
+	if !filetypes.DefaultSupportedMedia.IsMedia(mediaExt) {
+		return ""
 	}
-	if len(l) > 0 {
-		return l[0], nil
+	stem := strings.TrimSuffix(base, mediaExt)
+	if p, ok := dirSidecars[stem+lowExt]; ok {
+		return p
 	}
-
-	ext = path.Ext(base)
-	if !filetypes.DefaultSupportedMedia.IsMedia(ext) {
-		return "", nil
-	}
-	base = strings.TrimSuffix(base, ext)
-
-	l, err = fs.Glob(fsys, base+ext2)
-	if err != nil {
-		return "", err
-	}
-	if len(l) > 0 {
-		return l[0], nil
-	}
-	return "", nil
+	return ""
 }
 
 func matchesBanned(list namematcher.List, name string, isDir bool) bool {

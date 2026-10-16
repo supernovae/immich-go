@@ -96,38 +96,35 @@ func (at *AssetTracker) DiscoverAndDiscard(file fshelper.FSAndName, fileSize int
 	at.mu.Lock()
 	defer at.mu.Unlock()
 
-	key := file.FullName()
-	if _, exists := at.assets[key]; exists {
-		// Asset already tracked
-		if at.log != nil {
-			at.log.Warn("Asset already tracked", "file", file, "code", eventCode)
-		}
-		return
-	}
-
-	now := time.Now()
-	record := &AssetRecord{
-		File:         file,
-		FileSize:     fileSize,
-		State:        StateDiscarded,
-		EventCode:    eventCode,
-		Reason:       reason,
-		DiscoveredAt: now,
-		FinalizedAt:  now,
-	}
-
 	if at.debugMode {
-		record.EventHistory = []EventRecord{
-			{
-				Code:      eventCode,
-				Timestamp: now,
-				Message:   "Asset discovered and immediately discarded",
-				Args:      map[string]any{"reason": reason},
+		key := file.FullName()
+		if _, exists := at.assets[key]; exists {
+			if at.log != nil {
+				at.log.Warn("Asset already tracked", "file", file, "code", eventCode)
+			}
+			return
+		}
+
+		now := time.Now()
+		record := &AssetRecord{
+			File:         file,
+			FileSize:     fileSize,
+			State:        StateDiscarded,
+			EventCode:    eventCode,
+			Reason:       reason,
+			DiscoveredAt: now,
+			FinalizedAt:  now,
+			EventHistory: []EventRecord{
+				{
+					Code:      eventCode,
+					Timestamp: now,
+					Message:   "Asset discovered and immediately discarded",
+					Args:      map[string]any{"reason": reason},
+				},
 			},
 		}
+		at.assets[key] = record
 	}
-
-	at.assets[key] = record
 	at.discarded++
 	at.assetSize += fileSize
 	at.discardedSize += fileSize
@@ -154,21 +151,26 @@ func (at *AssetTracker) SetProcessed(file fshelper.FSAndName, eventCode fileeven
 		return
 	}
 
+	at.pending--
+	at.processed++
+	at.processedSize += record.FileSize
+
+	if !at.debugMode {
+		delete(at.assets, key)
+		return
+	}
+
 	record.State = StateProcessed
 	record.EventCode = eventCode
 	record.FinalizedAt = time.Now()
 
-	if at.debugMode && record.EventHistory != nil {
+	if record.EventHistory != nil {
 		record.EventHistory = append(record.EventHistory, EventRecord{
 			Code:      eventCode,
 			Timestamp: record.FinalizedAt,
 			Message:   "Asset processed",
 		})
 	}
-
-	at.pending--
-	at.processed++
-	at.processedSize += record.FileSize
 }
 
 // SetDiscarded transitions an asset to the DISCARDED state
@@ -192,12 +194,21 @@ func (at *AssetTracker) SetDiscarded(file fshelper.FSAndName, eventCode fileeven
 		return
 	}
 
+	at.pending--
+	at.discarded++
+	at.discardedSize += record.FileSize
+
+	if !at.debugMode {
+		delete(at.assets, key)
+		return
+	}
+
 	record.State = StateDiscarded
 	record.EventCode = eventCode
 	record.Reason = reason
 	record.FinalizedAt = time.Now()
 
-	if at.debugMode && record.EventHistory != nil {
+	if record.EventHistory != nil {
 		record.EventHistory = append(record.EventHistory, EventRecord{
 			Code:      eventCode,
 			Timestamp: record.FinalizedAt,
@@ -205,10 +216,6 @@ func (at *AssetTracker) SetDiscarded(file fshelper.FSAndName, eventCode fileeven
 			Args:      map[string]any{"reason": reason},
 		})
 	}
-
-	at.pending--
-	at.discarded++
-	at.discardedSize += record.FileSize
 }
 
 // SetError transitions an asset to the ERROR state
@@ -232,12 +239,21 @@ func (at *AssetTracker) SetError(file fshelper.FSAndName, eventCode fileevent.Co
 		return
 	}
 
+	at.pending--
+	at.errors++
+	at.errorSize += record.FileSize
+
+	if !at.debugMode {
+		delete(at.assets, key)
+		return
+	}
+
 	record.State = StateError
 	record.EventCode = eventCode
 	record.Reason = err.Error()
 	record.FinalizedAt = time.Now()
 
-	if at.debugMode && record.EventHistory != nil {
+	if record.EventHistory != nil {
 		record.EventHistory = append(record.EventHistory, EventRecord{
 			Code:      eventCode,
 			Timestamp: record.FinalizedAt,
@@ -245,10 +261,6 @@ func (at *AssetTracker) SetError(file fshelper.FSAndName, eventCode fileevent.Co
 			Args:      map[string]any{"error": err.Error()},
 		})
 	}
-
-	at.pending--
-	at.errors++
-	at.errorSize += record.FileSize
 }
 
 // GetCounters returns current asset counters

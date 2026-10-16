@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -97,28 +96,28 @@ func (uc *UpCmd) runNoUI(ctx context.Context, app *app.Application) error {
 		})
 		err = processGrp.Wait()
 		if err != nil {
-			err := context.Cause(ctx)
-			if err != nil {
-				cancel(err)
-				return err
+			if cause := context.Cause(ctx); cause != nil {
+				cancel(cause)
+				close(stopProgress)
+				return cause
 			}
+			cancel(err)
+			close(stopProgress)
+			return err
 		}
 		preparationDone.Store(true)
 		err = uc.uploadLoop(ctx, groupChan)
+		finishErr := uc.finishing(ctx)
 		if err != nil {
 			cancel(err)
 		}
 
 		counts := app.FileProcessor().Logger().GetCounts()
-		messages := strings.Builder{}
 		if counts[fileevent.ErrorUploadFailed]+counts[fileevent.ErrorServerError]+counts[fileevent.ErrorFileAccess]+counts[fileevent.ErrorIncomplete] > 0 {
-			messages.WriteString("Some errors have occurred. Look at the log file for details\n")
+			app.Log().Warn("Some errors have occurred. Look at the log file for details")
 		}
 
-		if messages.Len() > 0 {
-			cancel(errors.New(messages.String()))
-		}
-		err = errors.Join(err, uc.finishing(ctx))
+		err = errors.Join(err, finishErr)
 		close(stopProgress)
 		return err
 	})
