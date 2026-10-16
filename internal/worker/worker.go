@@ -17,7 +17,7 @@ type Pool struct {
 // NewPool creates a new Pool with a specified number of workers.
 func NewPool(numWorkers int) *Pool {
 	pool := &Pool{
-		tasks: make(chan Task, max(numWorkers*4, 16)),
+		tasks: make(chan Task, max(numWorkers, 4)),
 	}
 
 	for range numWorkers {

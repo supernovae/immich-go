@@ -65,10 +65,24 @@ func (ifc *ImportFolderCmd) run(cmd *cobra.Command, args []string, app *app.Appl
 	// create the adapter for folders
 	ifc.supportedMedia = ifc.app.GetSupportedMedia()
 
+	if f := cmd.Flags().Lookup("manage-burst"); f != nil {
+		_ = ifc.ManageBurst.Set(f.Value.String())
+	}
+	if f := cmd.Flags().Lookup("manage-heic-jpeg"); f != nil {
+		_ = ifc.ManageHEICJPG.Set(f.Value.String())
+	}
+	if f := cmd.Flags().Lookup("manage-raw-jpeg"); f != nil {
+		_ = ifc.ManageRawJPG.Set(f.Value.String())
+	}
+	if b, err := cmd.Flags().GetBool("manage-epson-fastfoto"); err == nil {
+		ifc.ManageEpsonFastFoto = b
+	}
+
+	ifc.isArchive = cmd.Parent() != nil && cmd.Parent().Name() == "archive"
 	ifc.requiresDateInformation = ifc.InclusionFlags.DateRange.IsSet() ||
 		ifc.TakeDateFromFilename || ifc.ManageBurst != filters.BurstNothing ||
-		ifc.ManageHEICJPG != filters.HeicJpgNothing || ifc.ManageRawJPG != filters.RawJPGNothing
-
+		ifc.ManageHEICJPG != filters.HeicJpgNothing || ifc.ManageRawJPG != filters.RawJPGNothing ||
+		ifc.isArchive
 	if ifc.PicasaAlbum {
 		ifc.picasaAlbums = gen.NewSyncMap[string, PicasaAlbum]() // make(map[string]PicasaAlbum)
 	}
@@ -101,7 +115,7 @@ func (ifc *ImportFolderCmd) run(cmd *cobra.Command, args []string, app *app.Appl
 const icloudMetadataExt = ".csv"
 
 func (ifc *ImportFolderCmd) Browse(ctx context.Context) chan *assets.Group {
-	gOut := make(chan *assets.Group, 64)
+	gOut := make(chan *assets.Group, max(ifc.app.ConcurrentTask, 4))
 	go func() {
 		defer func() {
 			close(gOut)
@@ -263,7 +277,7 @@ func (ifc *ImportFolderCmd) parseDir(ctx context.Context, fsys fs.FS, dir string
 
 		if !ifc.InclusionFlags.IncludedExtensions.Include(ext) {
 			// Get file size for discarded asset
-			if info, err := fs.Stat(fsys, name); err == nil {
+			if info, err := entryInfo(fsys, name, entry); err == nil {
 				ifc.processor.RecordAssetDiscardedImmediately(ctx, fshelper.FSName(fsys, name), info.Size(), fileevent.DiscardedFiltered, "extension not included")
 			}
 			continue
@@ -271,7 +285,7 @@ func (ifc *ImportFolderCmd) parseDir(ctx context.Context, fsys fs.FS, dir string
 
 		if ifc.InclusionFlags.ExcludedExtensions.Exclude(ext) {
 			// Get file size for discarded asset
-			if info, err := fs.Stat(fsys, name); err == nil {
+			if info, err := entryInfo(fsys, name, entry); err == nil {
 				ifc.processor.RecordAssetDiscardedImmediately(ctx, fshelper.FSName(fsys, name), info.Size(), fileevent.DiscardedFiltered, "extension excluded")
 			}
 			continue
@@ -286,7 +300,7 @@ func (ifc *ImportFolderCmd) parseDir(ctx context.Context, fsys fs.FS, dir string
 			if mediaType == filetypes.TypeVideo {
 				code = fileevent.DiscoveredVideo
 			}
-			a, err := ifc.assetFromFile(ctx, fsys, name)
+			a, err := ifc.assetFromEntry(ctx, fsys, name, entry)
 			if err != nil {
 				fileRef := fshelper.FSName(fsys, name)
 				ifc.processor.RecordAssetDiscovered(ctx, fileRef, 0, code)
@@ -297,47 +311,48 @@ func (ifc *ImportFolderCmd) parseDir(ctx context.Context, fsys fs.FS, dir string
 				continue
 			}
 			if a != nil {
-				// Record asset discovery with size
-				ifc.processor.RecordAssetDiscovered(ctx, a.File, int64(a.FileSize), code)
 				as = append(as, a)
 			}
 		}
 	}
 
-	// process the left over dirs
-	for _, entry := range entries {
-		base := entry.Name()
-		name := path.Join(dir, base)
-		if entry.IsDir() {
-			if matchesBanned(ifc.BannedFiles, name, true) {
-				ifc.processor.RecordNonAsset(ctx, fshelper.FSName(fsys, name), 0, fileevent.DiscoveredBanned, "reason", "banned folder")
-				continue // Skip this folder, no error
-			}
-			if ifc.Recursive && entry.Name() != "." {
-				ifc.concurrentParseDir(ctx, fsys, name, gOut)
-			}
-			continue
-		}
-	}
+	if len(as) > 0 {
+		eagerDate := ifc.isArchive ||
+			ifc.InclusionFlags.DateRange.IsSet() ||
+			ifc.ManageBurst != filters.BurstNothing ||
+			ifc.ManageHEICJPG != filters.HeicJpgNothing ||
+			ifc.ManageRawJPG != filters.RawJPGNothing
 
-	in := make(chan *assets.Asset, 64)
-	go func() {
-		defer close(in)
+		in := make(chan *assets.Asset, 4)
+		go func() {
+			defer close(in)
 
-		sort.Slice(as, func(i, j int) bool {
-			// Sort by radical first
-			radicalI := as[i].Radical
-			radicalJ := as[j].Radical
-			if radicalI != radicalJ {
-				return radicalI < radicalJ
-			}
-			// If radicals are the same, sort by date
-			return as[i].CaptureDate.Before(as[j].CaptureDate)
-		})
+			sort.Slice(as, func(i, j int) bool {
+				// Sort by radical first
+				radicalI := as[i].Radical
+				radicalJ := as[j].Radical
+				if radicalI != radicalJ {
+					return radicalI < radicalJ
+				}
+				// If radicals are the same, sort by date
+				if !as[i].CaptureDate.Equal(as[j].CaptureDate) {
+					return as[i].CaptureDate.Before(as[j].CaptureDate)
+				}
+				return as[i].FileDate.Before(as[j].FileDate)
+			})
 
-		for _, a := range as {
-			// check the presence of a JSON file
-			jsonName := findSideCarInDir(dirSidecars, a.File.Name(), ".json")
+			for i, a := range as {
+				select {
+				case <-ctx.Done():
+					for _, rem := range as[i:] {
+						rem.Close()
+					}
+					return
+				default:
+				}
+
+				// check the presence of a JSON file
+				jsonName := findSideCarInDir(dirSidecars, a.File.Name(), ".json")
 			if jsonName != "" {
 				buf, err := fs.ReadFile(fsys, jsonName)
 				if err != nil {
@@ -392,32 +407,28 @@ func (ifc *ImportFolderCmd) parseDir(ctx context.Context, fsys fs.FS, dir string
 					}
 				}
 				if a.CaptureDate.IsZero() {
-					// no date in XMP, JSON, try reading the metadata
-					f, err := a.File.Open()
-					if err == nil {
-						md, err := exif.GetMetaData(f, a.Ext, ifc.tz)
-						if err == nil {
-							a.FromSourceFile = a.UseMetadata(md)
-						}
-						if (md == nil || md.DateTaken.IsZero()) && !a.Taken.IsZero() && ifc.TakeDateFromFilename {
-							// no exif, but we have a date in the filename and the TakeDateFromFilename is set
-							a.FromApplication = &assets.Metadata{
-								DateTaken: a.Taken,
-							}
-							a.CaptureDate = a.FromApplication.DateTaken
-						}
-						_ = f.Close()
+					sameRadical := (i > 0 && as[i-1].Radical == a.Radical) || (i+1 < len(as) && as[i+1].Radical == a.Radical)
+					if eagerDate || sameRadical {
+						ifc.loadAssetDate(a, nil)
+					} else {
+						asset := a
+						asset.SetDateLoader(func(header []byte) {
+							ifc.loadAssetDate(asset, header)
+						})
 					}
 				}
 			}
 
 			if !ifc.InclusionFlags.DateRange.InRange(a.CaptureDate) {
+				code := fileevent.DiscoveredImage
+				if a.Type == filetypes.TypeVideo {
+					code = fileevent.DiscoveredVideo
+				}
 				a.Close()
+				ifc.processor.RecordAssetDiscovered(ctx, a.File, int64(a.FileSize), code)
 				ifc.processor.RecordAssetDiscarded(ctx, a.File, int64(a.FileSize), fileevent.DiscardedFiltered, "asset outside date range")
 				continue
 			}
-
-			// Add folder as tags
 			if ifc.FolderAsTags {
 				t := fsName
 				if dir != "." {
@@ -470,20 +481,53 @@ func (ifc *ImportFolderCmd) parseDir(ctx context.Context, fsys fs.FS, dir string
 				}
 			}
 
+				select {
+				case in <- a:
+				case <-ctx.Done():
+					for _, rem := range as[i:] {
+						rem.Close()
+					}
+					return
+				}
+			}
+		}()
+
+		gs := groups.NewGrouperPipeline(ctx, ifc.groupers...).PipeGrouper(ctx, in)
+		for g := range gs {
+			if ctx.Err() != nil {
+				for _, a := range g.Assets {
+					a.Close()
+				}
+				return ctx.Err()
+			}
+			for _, a := range g.Assets {
+				code := fileevent.DiscoveredImage
+				if a.Type == filetypes.TypeVideo {
+					code = fileevent.DiscoveredVideo
+				}
+				ifc.processor.RecordAssetDiscovered(ctx, a.File, int64(a.FileSize), code)
+			}
 			select {
-			case in <- a:
+			case gOut <- g:
 			case <-ctx.Done():
-				return
+				return ctx.Err()
 			}
 		}
-	}()
+	}
 
-	gs := groups.NewGrouperPipeline(ctx, ifc.groupers...).PipeGrouper(ctx, in)
-	for g := range gs {
-		select {
-		case gOut <- g:
-		case <-ctx.Done():
-			return ctx.Err()
+	// process the left over dirs
+	for _, entry := range entries {
+		base := entry.Name()
+		name := path.Join(dir, base)
+		if entry.IsDir() {
+			if matchesBanned(ifc.BannedFiles, name, true) {
+				ifc.processor.RecordNonAsset(ctx, fshelper.FSName(fsys, name), 0, fileevent.DiscoveredBanned, "reason", "banned folder")
+				continue // Skip this folder, no error
+			}
+			if ifc.Recursive && entry.Name() != "." {
+				ifc.concurrentParseDir(ctx, fsys, name, gOut)
+			}
+			continue
 		}
 	}
 	return nil
@@ -526,12 +570,60 @@ func matchesBanned(list namematcher.List, name string, isDir bool) bool {
 	return false
 }
 
-func (ifc *ImportFolderCmd) assetFromFile(_ context.Context, fsys fs.FS, name string) (*assets.Asset, error) {
+func entryInfo(fsys fs.FS, name string, entry fs.DirEntry) (fs.FileInfo, error) {
+	if entry != nil {
+		if info, err := entry.Info(); err == nil {
+			return info, nil
+		}
+	}
+	return fs.Stat(fsys, name)
+}
+
+func (ifc *ImportFolderCmd) loadAssetDate(a *assets.Asset, header []byte) {
+	if !a.CaptureDate.IsZero() {
+		return
+	}
+	var md *assets.Metadata
+	var err error
+	if len(header) > 0 {
+		md, err = exif.GetMetaData(bytes.NewReader(header), a.Ext, ifc.tz)
+		if err == nil {
+			a.FromSourceFile = a.UseMetadata(md)
+		} else if a.FileSize > len(header) {
+			f, openErr := a.File.Open()
+			if openErr == nil {
+				md, err = exif.GetMetaData(f, a.Ext, ifc.tz)
+				if err == nil {
+					a.FromSourceFile = a.UseMetadata(md)
+				}
+				_ = f.Close()
+			}
+		}
+	} else {
+		f, openErr := a.File.Open()
+		if openErr == nil {
+			md, err = exif.GetMetaData(f, a.Ext, ifc.tz)
+			if err == nil {
+				a.FromSourceFile = a.UseMetadata(md)
+			}
+			_ = f.Close()
+		}
+	}
+	if (md == nil || md.DateTaken.IsZero()) && !a.Taken.IsZero() && ifc.TakeDateFromFilename {
+		// no exif, but we have a date in the filename and the TakeDateFromFilename is set
+		a.FromApplication = &assets.Metadata{
+			DateTaken: a.Taken,
+		}
+		a.CaptureDate = a.FromApplication.DateTaken
+	}
+}
+
+func (ifc *ImportFolderCmd) assetFromEntry(_ context.Context, fsys fs.FS, name string, entry fs.DirEntry) (*assets.Asset, error) {
 	a := &assets.Asset{
 		File:             fshelper.FSName(fsys, name),
 		OriginalFileName: filepath.Base(name),
 	}
-	i, err := fs.Stat(fsys, name)
+	i, err := entryInfo(fsys, name, entry)
 	if err != nil {
 		a.Close()
 		return nil, err

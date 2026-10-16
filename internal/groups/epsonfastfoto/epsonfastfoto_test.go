@@ -44,12 +44,14 @@ func TestGroup(t *testing.T) {
 		mockAsset(ic, "SceneryAndWildlife_0005_b.jpg", baseTime.Add(2200*time.Millisecond)),
 		mockAsset(ic, "SceneryAndWildlife_0005.jpg", baseTime.Add(2400*time.Millisecond)),
 		mockAsset(ic, "img_0005.jpg", baseTime.Add(1200*time.Millisecond)),
+		mockAsset(ic, "video_0006.mp4", baseTime.Add(2600*time.Millisecond)),
 	}
 
 	expectedAssets := []*assets.Asset{
 		mockAsset(ic, "img_0001.jpg", baseTime.Add(1200*time.Millisecond)),
 		mockAsset(ic, "img_0002.jpg", baseTime.Add(1200*time.Millisecond)),
 		mockAsset(ic, "img_0005.jpg", baseTime.Add(1200*time.Millisecond)),
+		mockAsset(ic, "video_0006.mp4", baseTime.Add(2600*time.Millisecond)),
 	}
 
 	expectedGroup := []*assets.Group{

@@ -47,8 +47,8 @@ func NewGrouperPipeline(ctx context.Context, gs ...Grouper) *GrouperPipeline {
 // Group opens and closes intermediate channels as required.
 func (p *GrouperPipeline) PipeGrouper(ctx context.Context, in chan *assets.Asset) chan *assets.Group {
 	// Create buffered channels to prevent lock-step pipeline stalls
-	gOut := make(chan *assets.Group, 64) // output channel for groups
-	out := make(chan *assets.Asset, 64)  // output channel for the last grouper
+	gOut := make(chan *assets.Group, 8) // output channel for groups
+	out := make(chan *assets.Asset, 8)  // output channel for the last grouper
 
 	inChans := make([]chan *assets.Asset, len(p.groupers))
 	outChans := make([]chan *assets.Asset, len(p.groupers))
@@ -61,7 +61,7 @@ func (p *GrouperPipeline) PipeGrouper(ctx context.Context, in chan *assets.Asset
 			inChans[i] = outChans[i-1]
 		}
 		if i < len(p.groupers)-1 {
-			outChans[i] = make(chan *assets.Asset, 64) // intermediate channels between groupers
+			outChans[i] = make(chan *assets.Asset, 8) // intermediate channels between groupers
 		} else {
 			outChans[i] = out
 		}

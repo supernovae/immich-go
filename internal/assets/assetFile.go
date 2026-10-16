@@ -38,6 +38,8 @@ func (a *Asset) OpenFile() (osfs.OSFS, error) {
 
 // Close close the temporary file  and close the source
 func (a *Asset) Close() error {
+	a.dateLoader = nil
+	a.headerBuf = nil
 	if a.cacheReader == nil {
 		return nil
 	}

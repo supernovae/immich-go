@@ -211,11 +211,8 @@ func (toc *TakeoutCmd) passOneFsWalk(ctx context.Context, w fs.FS) error {
 					if strings.Contains(name, "Failed Videos") {
 						toc.processor.RecordAssetDiscardedImmediately(ctx, fshelper.FSName(w, name), finfo.Size(), fileevent.DiscardedFiltered, "can't upload failed videos")
 						return nil
-					} else {
-						toc.processor.RecordAssetDiscovered(ctx, fshelper.FSName(w, name), finfo.Size(), fileevent.DiscoveredVideo)
 					}
 				case filetypes.TypeImage:
-					toc.processor.RecordAssetDiscovered(ctx, fshelper.FSName(w, name), finfo.Size(), fileevent.DiscoveredImage)
 				}
 
 				key := fileKeyTracker{
@@ -234,6 +231,11 @@ func (toc *TakeoutCmd) passOneFsWalk(ctx context.Context, w fs.FS) error {
 					return nil
 				}
 
+				if t == filetypes.TypeVideo {
+					toc.processor.RecordAssetDiscovered(ctx, fshelper.FSName(w, name), finfo.Size(), fileevent.DiscoveredVideo)
+				} else if t == filetypes.TypeImage {
+					toc.processor.RecordAssetDiscovered(ctx, fshelper.FSName(w, name), finfo.Size(), fileevent.DiscoveredImage)
+				}
 				dirCatalog.unMatchedFiles[base] = &assetFile{
 					fsys:   w,
 					base:   base,
@@ -343,11 +345,14 @@ func (toc *TakeoutCmd) solvePuzzle(ctx context.Context) error {
 			sort.Strings(files)
 			for _, f := range files {
 				i := cat.unMatchedFiles[f]
-				toc.processor.RecordNonAsset(ctx, fshelper.FSName(i.fsys, path.Join(dir, i.base)), 0, fileevent.ProcessedMissingMetadata)
+				fileRef := fshelper.FSName(i.fsys, path.Join(dir, i.base))
+				toc.processor.RecordNonAsset(ctx, fileRef, 0, fileevent.ProcessedMissingMetadata)
 				if toc.KeepJSONLess {
 					a := toc.makeAsset(ctx, dir, i, nil)
 					cat.matchedFiles[f] = a
 					delete(cat.unMatchedFiles, f)
+				} else {
+					toc.processor.RecordAssetDiscarded(ctx, fileRef, int64(i.length), fileevent.DiscardedFiltered, "missing metadata")
 				}
 			}
 			cat.unMatchedFiles = nil

@@ -292,6 +292,8 @@ func (ii *immichIndex) ShouldUpload(la *assets.Asset, upCmd *UpCmd) (*Advice, er
 		return ii.adviceSameOnServer(sa), nil
 	}
 
+	la.EnsureDateLoaded()
+
 	filename := path.Base(la.File.Name())
 
 	// check all files with the same name

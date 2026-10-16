@@ -2,23 +2,52 @@
 
 **Immich-Go** is an open-source tool designed to streamline uploading large photo collections to your self-hosted Immich server.
 
-> ✅ Compatible with Immich V2 and **V3**<br>
-> ⚠️ This is an early version, not yet extensively tested<br>
-> ⚠️ Keep a backup copy of your files for safety<br>
+> ✅ **Immich V3+ Ready** — Actively maintained fork with reliability, performance, memory, and TUI fixes for large photo libraries and network/cloud mounts.<br>
+> ⚠️ Keep a backup copy of your files for safety.<br>
+
+## 🔧 What's Improved & Fixed in This Repo
+
+This repository ([`supernovae/immich-go`](https://github.com/supernovae/immich-go)) includes a comprehensive set of fixes and performance improvements for large-scale imports and Immich v3+:
+
+- **Fast Startup & Lazy Directory Scanning**:
+  - Validates server connectivity (`PingServer`, authentication, and server info) with a bounded startup check *before* scanning local or remote paths.
+  - `VirtualGlobFS` now evaluates directories lazily on demand instead of walking the entire filesystem tree before launching the TUI.
+- **Duplicate-Heavy & Network/FUSE Mount Optimization (`rclone`, NFS, SMB)**:
+  - Defers EXIF metadata reading until *after* SHA-1 checksum deduplication—files already on the server or duplicated locally are never opened a second time for EXIF parsing.
+  - Captures the first 64 KB header while computing the SHA-1 checksum so non-duplicate JPEGs extract EXIF in memory without reopening the file.
+  - Reuses `DirEntry.Info()` from directory reads and reuses open file handles in `CacheReader` instead of closing and reopening files before upload.
+  - Paces folder discovery with bounded pipeline buffers so `Pending` reflects active in-flight assets rather than spiking by hundreds or thousands of items at the end of a batch.
+- **TUI Progress & Lifecycle Tracking Fixes**:
+  - Added the live `Uploading:` progress gauge to the TUI footer across all upload modes (`from-folder`, `from-icloud`, `from-picasa`, and `from-google-photos`), dynamically refreshing as pending items are discovered and processed.
+  - Fixed `Pending` counter leaks when file reads fail during checksum calculation, when `--overwrite` replaces existing server assets, when `--manage-epson-fastfoto` encounters video/burst files, and when Google Takeout archives contain duplicate or unmatched files.
+  - Clean `Ctrl+C` / `Ctrl+Q` cancellation that stops queued workers immediately without logging spurious upload errors or hanging the terminal.
+- **Large-Import Resilience & API Retries**:
+  - Added exponential backoff + jitter retries for transient HTTP/5xx/429 server errors (`--api-retries`, default `3`; `--api-retry-delay`, default `500ms`) and optional upload pacing (`--upload-delay`, e.g. `50ms`).
+  - Fixed `io.ErrClosedPipe` handling when Immich closes the multipart stream early on duplicate detection or HTTP errors (such as `413 Request Entity Too Large`).
+  - Changed `--on-errors` default to `continue` so single-file or single-directory errors do not abort multi-hour batch imports.
+  - Replaced `immichIndex` panics on duplicate server checksums with warnings.
+- **Memory & File Descriptor Management**:
+  - Compacted in-memory indexed server/local `Asset` structs, evicted finalized records from `AssetTracker`, and released processed Google Takeout catalog maps to prevent multi-GB RAM growth on 100,000+ asset libraries.
+  - Replaced the global `CollectionCache` channel bottleneck with per-collection locking and ensured buffered album/tag updates flush cleanly in `--no-ui` mode.
+  - Replaced $O(N^2)$ `fs.Glob` sidecar lookups in `from-folder` with an $O(1)$ per-directory map and fixed Google Takeout fast-track JSON matching.
 
 ## 🌟 Key Features
 
-- **Immich V3 Ready**: Full compatibility with Immich V2 and V3
-- **Simple Installation**: No NodeJS or Docker required
+- **Immich V3+ Support**: Full compatibility with Immich V3 API endpoints and error formats
+- **Simple Installation**: Single static Go binary—no NodeJS or Docker required
 - **Multiple Sources**: Upload from Google Photos Takeouts, iCloud, local folders, ZIP archives, and other Immich servers
-- **Large Collections**: Successfully handles 100,000+ photos
-- **Smart Management**: Duplicate detection, burst photo stacking, RAW+JPEG handling
-- **Cross-Platform**: Available for Windows, macOS, Linux, and FreeBSD
+- **Large Collections**: Built to handle 100,000+ photos and cloud/network mounts reliably
+- **Smart Management**: Duplicate detection, burst photo stacking, RAW+JPEG and HEIC+JPEG handling
+- **Cross-Platform**: Works on Linux, macOS, Windows, and FreeBSD
 
 ## 🚀 Quick Start
 
-### 1. Install Immich-Go
-Download the pre-built binary for your system from the [GitHub releases page](https://github.com/simulot/immich-go/releases).
+### 1. Build or Install
+```bash
+git clone https://github.com/supernovae/immich-go.git
+cd immich-go
+go build -o immich-go .
+```
 
 ### 2. Basic Usage
 ```bash
@@ -30,6 +59,9 @@ immich-go upload from-google-photos --server=http://your-ip:2283 --api-key=your-
 
 # Archive photos from Immich server
 immich-go archive from-immich --from-server=http://your-ip:2283 --from-api-key=your-api-key --write-to-folder=/path/to/archive
+
+# Upload with custom concurrency, retry settings, or upload pacing
+immich-go upload from-folder --server=https://photos.example.com --api-key=your-api-key --concurrent-tasks=4 --api-retries=3 --upload-delay=25ms /path/to/your/photos
 ```
 
 ### 3. Requirements

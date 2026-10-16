@@ -4,7 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-
+	"sync"
 	"github.com/simulot/immich-go/internal/fshelper/debugfiles"
 	"github.com/simulot/immich-go/internal/fshelper/hash"
 	"github.com/simulot/immich-go/internal/fshelper/osfs"
@@ -13,6 +13,7 @@ import (
 
 // CacheReader is a reader that caches the data in a temporary file to allow multiple reads
 type CacheReader struct {
+	mu           sync.Mutex
 	tmpFile      osfs.OSFS //*os.File // tmpFile is the temporary file or the original file
 	name         string
 	shouldRemove bool
@@ -30,8 +31,7 @@ func NewCacheReader(name string, rc io.ReadCloser) (*CacheReader, string, error)
 	c := &CacheReader{}
 	if f, ok := rc.(osfs.OSFS); ok {
 		c.name = f.Name()
-		_ = f.Close()
-		debugfiles.TrackCloseFile(f)
+		c.tmpFile = f
 	} else {
 		d := os.Getenv("IMMICHGO_TEMPDIR")
 		if d == "" {
@@ -73,6 +73,21 @@ func NewCacheReader(name string, rc io.ReadCloser) (*CacheReader, string, error)
 
 // OpenFile creates a new file handler based on the temporary file
 func (cr *CacheReader) OpenFile() (*tempFile, error) {
+	cr.mu.Lock()
+	if cr.tmpFile != nil {
+		f := cr.tmpFile
+		cr.tmpFile = nil
+		cr.mu.Unlock()
+		if osFile, ok := f.(*os.File); ok {
+			if _, err := osFile.Seek(0, io.SeekStart); err == nil {
+				return &tempFile{File: osFile, cr: cr}, nil
+			}
+		}
+		debugfiles.TrackCloseFile(f)
+		_ = f.Close()
+	} else {
+		cr.mu.Unlock()
+	}
 	f, err := os.Open(cr.name)
 	if err != nil {
 		return nil, err
@@ -83,6 +98,8 @@ func (cr *CacheReader) OpenFile() (*tempFile, error) {
 
 // Close closes the temporary file only if it was created by NewCacheReader
 func (cr *CacheReader) Close() error {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
 	var err error
 	if cr.tmpFile != nil {
 		debugfiles.TrackCloseFile(cr.tmpFile)

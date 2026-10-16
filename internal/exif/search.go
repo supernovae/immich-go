@@ -31,21 +31,27 @@ func searchPattern(r io.Reader, pattern []byte, buffer []byte) (*sliceReader, er
 	for {
 		// Read a chunk of data into the buffer
 		bytesRead, err = r.Read(buffer[ofs:])
+		if bytesRead > 0 {
+			total := ofs + bytesRead
+			// Search for the pattern within the buffer
+			index := bytes.Index(buffer[:total], pattern)
+			if index >= 0 {
+				return newSliceReader(io.MultiReader(bytes.NewReader(buffer[index:total]), r)), nil
+			}
+
+			// Move the remaining bytes of the current buffer to the beginning
+			keep := min(len(pattern)-1, total)
+			if keep > 0 {
+				copy(buffer, buffer[total-keep:total])
+			}
+			ofs = keep
+			pos += bytesRead
+		}
 		if err != nil {
 			return nil, err
 		}
-
-		// Search for the pattern within the buffer
-		index := bytes.Index(buffer[:ofs+bytesRead], pattern)
-		if index >= 0 {
-			return newSliceReader(io.MultiReader(bytes.NewReader(buffer[index:]), r)), nil
+		if bytesRead == 0 {
+			return nil, io.EOF
 		}
-
-		// Move the remaining bytes of the current buffer to the beginning
-		p := bytesRead + ofs - len(pattern) + 1
-
-		copy(buffer, buffer[p:bytesRead+ofs])
-		ofs = len(pattern) - 1
-		pos += bytesRead
 	}
 }

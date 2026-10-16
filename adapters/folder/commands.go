@@ -52,6 +52,7 @@ type ImportFolderCmd struct {
 	picasaAlbums            *gen.SyncMap[string, PicasaAlbum] // ap[string]PicasaAlbum
 	icloudMetas             *gen.SyncMap[string, iCloudMeta]
 	icloudMetaPass          bool
+	isArchive               bool
 }
 
 func (ifc *ImportFolderCmd) RegisterFlags(flags *pflag.FlagSet, cmd *cobra.Command) {

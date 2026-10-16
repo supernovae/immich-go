@@ -318,10 +318,19 @@ func (uc *UpCmd) handleGroup(ctx context.Context, g *assets.Group) error {
 	}
 
 	// Upload assets from the group
-	for _, a := range g.Assets {
+	for i, a := range g.Assets {
+		if ctx.Err() != nil {
+			for _, rem := range g.Assets[i:] {
+				rem.Close()
+			}
+			return ctx.Err()
+		}
 		err := uc.handleAsset(ctx, a)
 		if err != nil {
 			if procErr := uc.app.ProcessError(err); procErr != nil {
+				for _, rem := range g.Assets[i+1:] {
+					rem.Close()
+				}
 				errGroup = errors.Join(errGroup, procErr)
 				break
 			}
@@ -361,6 +370,9 @@ func (uc *UpCmd) handleAsset(ctx context.Context, a *assets.Asset) error {
 	// var status stri g
 	advice, err := uc.assetIndex.ShouldUpload(a, uc)
 	if err != nil {
+		if ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+			uc.app.FileProcessor().RecordAssetError(ctx, a.File, int64(a.FileSize), fileevent.ErrorFileAccess, err)
+		}
 		return err
 	}
 
@@ -386,11 +398,16 @@ func (uc *UpCmd) handleAsset(ctx context.Context, a *assets.Asset) error {
 		}
 
 		uc.processUploadedAsset(ctx, a, serverStatus)
-		uc.app.FileProcessor().RecordAssetProcessed(ctx, a.File, int64(a.FileSize), fileevent.ProcessedUploadUpgraded)
+		if serverStatus != immich.UploadDuplicate {
+			uc.app.FileProcessor().RecordAssetProcessed(ctx, a.File, int64(a.FileSize), fileevent.ProcessedUploadUpgraded)
+		}
 
 		return nil
 
 	case AlreadyProcessed: // SHA1 already processed
+		if advice.ServerAsset != nil {
+			a.ID = advice.ServerAsset.ID
+		}
 		// Record as discarded - duplicate in input
 		uc.app.FileProcessor().RecordNonAsset(ctx, a.File, int64(a.FileSize), fileevent.DiscardedLocalDuplicate)
 		uc.app.FileProcessor().RecordAssetProcessed(ctx, a.File, int64(a.FileSize), fileevent.ProcessedMetadataUpdated)
@@ -421,6 +438,9 @@ func (uc *UpCmd) handleAsset(ctx context.Context, a *assets.Asset) error {
 
 			// Upload the superior asset
 			serverStatus, err = uc.replaceAsset(ctx, a, advice.ServerAsset)
+			if err == nil && serverStatus != immich.UploadDuplicate {
+				uc.app.FileProcessor().RecordAssetProcessed(ctx, a.File, int64(a.FileSize), fileevent.ProcessedUploadUpgraded)
+			}
 		} else {
 			serverStatus, err = uc.uploadAsset(ctx, a)
 		}
@@ -450,8 +470,10 @@ func (uc *UpCmd) uploadAsset(ctx context.Context, a *assets.Asset) (string, erro
 
 	ar, err := uc.client.Immich.AssetUpload(ctx, a)
 	if err != nil {
-		// Record upload error
-		uc.app.FileProcessor().RecordAssetError(ctx, a.File, int64(a.FileSize), fileevent.ErrorServerError, err)
+		if ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+			// Record upload error
+			uc.app.FileProcessor().RecordAssetError(ctx, a.File, int64(a.FileSize), fileevent.ErrorServerError, err)
+		}
 		return "", err // Must signal the error to the caller
 	}
 	if ar.Status == immich.UploadDuplicate {
@@ -505,8 +527,10 @@ func (uc *UpCmd) replaceAsset(ctx context.Context, newAsset, oldAsset *assets.As
 	// 1. Upload the new asset
 	ar, err := uc.client.Immich.AssetUpload(ctx, newAsset)
 	if err != nil {
-		// Record upload error
-		uc.app.FileProcessor().RecordAssetError(ctx, newAsset.File, int64(newAsset.FileSize), fileevent.ErrorServerError, err)
+		if ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+			// Record upload error
+			uc.app.FileProcessor().RecordAssetError(ctx, newAsset.File, int64(newAsset.FileSize), fileevent.ErrorServerError, err)
+		}
 		return "", err // Must signal the error to the caller
 	}
 	newAsset.ID = ar.ID

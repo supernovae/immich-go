@@ -3,6 +3,7 @@ package assets
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"path"
 	"time"
@@ -72,6 +73,39 @@ type Asset struct {
 
 	// buffer management
 	cacheReader *cachereader.CacheReader
+	dateLoader  func(header []byte)
+	headerBuf   []byte
+}
+
+const maxHeaderCaptureSize = 64 * 1024
+
+type headerCaptureReader struct {
+	r   io.Reader
+	buf []byte
+	max int
+}
+
+func (h *headerCaptureReader) Read(p []byte) (int, error) {
+	n, err := h.r.Read(p)
+	if n > 0 && len(h.buf) < h.max {
+		rem := h.max - len(h.buf)
+		h.buf = append(h.buf, p[:min(n, rem)]...)
+	}
+	return n, err
+}
+
+func (a *Asset) SetDateLoader(fn func(header []byte)) {
+	a.dateLoader = fn
+}
+
+func (a *Asset) EnsureDateLoaded() {
+	if a.dateLoader != nil {
+		fn := a.dateLoader
+		header := a.headerBuf
+		a.dateLoader = nil
+		a.headerBuf = nil
+		fn(header)
+	}
 }
 
 // Kind is the probable type of the image
@@ -192,9 +226,27 @@ func (a *Asset) GetChecksum() (string, error) {
 	}
 	defer f.Close()
 
-	sha1Hash, err := hash.Base64Encode(hash.GetSHA1Hash(f))
+	var r io.Reader = f
+	var hr *headerCaptureReader
+	if a.dateLoader != nil && a.CaptureDate.IsZero() {
+		capSize := maxHeaderCaptureSize
+		if a.FileSize > 0 && a.FileSize < capSize {
+			capSize = a.FileSize
+		}
+		hr = &headerCaptureReader{
+			r:   f,
+			buf: make([]byte, 0, capSize),
+			max: maxHeaderCaptureSize,
+		}
+		r = hr
+	}
+
+	sha1Hash, err := hash.Base64Encode(hash.GetSHA1Hash(r))
 	if err != nil {
 		return "", err
+	}
+	if hr != nil {
+		a.headerBuf = hr.buf
 	}
 	a.Checksum = sha1Hash
 	return a.Checksum, nil

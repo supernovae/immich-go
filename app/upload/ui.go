@@ -165,11 +165,6 @@ func (uc *UpCmd) runUI(ctx context.Context, app *app.Application) error {
 						processedGP := counts[fileevent.ProcessedAssociatedMetadata] +
 							counts[fileevent.ProcessedMissingMetadata]
 						ui.immichPrepare.SetValue(int(processedGP))
-
-						if preparationDone.Load() {
-							ui.immichUpload.SetMaxValue(int(app.FileProcessor().Logger().TotalAssets()))
-						}
-						// ui.immichUpload.SetValue(int(app.Jnl().TotalProcessed(uc.takeoutOptions.KeepJSONLess)))
 					}
 				})
 			}
@@ -371,7 +366,8 @@ func (uc *UpCmd) newUI(ctx context.Context, a *app.Application) *uiPage {
 		ui.footer.AddItem(tview.NewTextView().SetText("Uploading:").SetTextAlign(tview.AlignCenter), 0, 4, 1, 1, 0, 0, false).AddItem(ui.immichUpload, 0, 5, 1, 1, 0, 0, false)
 		ui.footer.SetColumns(25, 0, 25, 0, 25, 0)
 	} else {
-		ui.footer.SetColumns(25, 0)
+		ui.footer.AddItem(tview.NewTextView().SetText("Uploading:").SetTextAlign(tview.AlignCenter), 0, 2, 1, 1, 0, 0, false).AddItem(ui.immichUpload, 0, 3, 1, 1, 0, 0, false)
+		ui.footer.SetColumns(25, 0, 25, 0)
 	}
 	ui.screen.AddItem(ui.footer, 3, 0, 1, 1, 0, 0, false)
 
@@ -580,6 +576,12 @@ func (ui *uiPage) updateStatusZone() {
 	if ui.discoveryViews != nil {
 		ui.discoveryViews["discoveredCount"].SetText(fmt.Sprintf("%6d", totalCount))
 		ui.discoveryViews["discoveredSize"].SetText(ui.formatBytes(totalSize))
+	}
+
+	if ui.immichUpload != nil && totalCount > 0 {
+		completedCount := processedCount + discardedCount + errorCount
+		ui.immichUpload.SetMaxValue(totalCount)
+		ui.immichUpload.SetValue(completedCount)
 	}
 }
 

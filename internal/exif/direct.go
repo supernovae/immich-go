@@ -45,7 +45,7 @@ func MetadataFromDirectRead(f io.Reader, name string, localTZ *time.Location) (*
 // readExifMetadata locate the Exif part and return the date of capture
 func readExifMetadata(r io.Reader, localTZ *time.Location) (*assets.Metadata, error) {
 	// try to read the Exif data directly
-	readBuffer := bytes.NewBuffer(make([]byte, searchBufferSize))
+	readBuffer := bytes.NewBuffer(make([]byte, 0, searchBufferSize))
 	r2 := io.TeeReader(r, readBuffer)
 	x, err := exif.Decode(r2)
 	if err == nil || !exif.IsCriticalError(err) {
